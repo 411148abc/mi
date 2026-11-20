@@ -1,0 +1,283 @@
+-- json.mi — 自举版 JSON 编解码器（用 MI 自己写的解析器）。
+--
+-- 为什么自己写：解释器要把「宿主装配体」读成内部值，而 MI 没有按运行时名字
+-- 读字段的能力（`m.op` 这类动态取值不成立）。所以统一走 JSON 文本：编码用
+-- 宿主的 json.text（只读，安全），解码用这里的解析器，产出的直接是内部表示
+-- { tag: "asm", pairs }。
+--
+-- 公开端口：
+--   json_encode(value)      -> JSON 文本（内部值 → 文本）
+--   json_decode(text)       -> { value, pos, ok }（文本 → 内部值）
+--   json_decode_all(text)   -> 值（解析失败返回 nothing）
+
+use "values.mi"
+
+-- 说明：把内部值编码成 JSON 文本。
+station json_encode(value) {
+    out value: encode_value(value: value)
+}
+
+-- 说明：编码单值。
+station encode_value(value) {
+    ~acc: ""
+    ~shape: kind_of(value: value)
+    when shape is "nothing" {
+        emit acc: "null"
+    } otherwise when shape is "flag" {
+        emit acc: "false"
+        when value { emit acc: "true" }
+    } otherwise when shape is "number" {
+        emit acc: number_text(value: value)
+    } otherwise when shape is "text" {
+        emit acc: encode_text(text_value: value)
+    } otherwise when shape is "list" {
+        ~parts: []
+        cycle over value as item {
+            emit parts: push(into: parts, value: encode_value(value: item))
+        }
+        emit acc: "[" + join(items: parts, with: ",") + "]"
+    } otherwise when shape is "assembly" {
+        ~parts: []
+        cycle over value.pairs as pair {
+            emit parts: push(into: parts, value: encode_text(text_value: at(items: pair, index: 0)) + ":" + encode_value(value: at(items: pair, index: 1)))
+        }
+        emit acc: "{" + join(items: parts, with: ",") + "}"
+    } otherwise {
+        emit acc: "null"
+    }
+    out value: acc
+}
+
+-- 说明：编码文本（转义引号、反斜杠、控制字符）。
+station encode_text(text_value) {
+    ~parts: ["\""]
+    cycle over span(from: 0, to: len(value: text_value)) as k {
+        ~ch: at(items: text_value, index: k)
+        ~piece: ch
+        when ch is "\"" { emit piece: "\\\"" }
+        when ch is "\\" { emit piece: "\\\\" }
+        when ch is "\n" { emit piece: "\\n" }
+        when ch is "\r" { emit piece: "\\r" }
+        when ch is "\t" { emit piece: "\\t" }
+        emit parts: push(into: parts, value: piece)
+    }
+    out value: join(items: push(into: parts, value: "\""), with: "")
+}
+
+-- 说明：解析 JSON 文本，返回内部值（失败返回 nothing）。
+station json_decode(text_value) {
+    ~scan: parse_value(text_value: text_value, _pos: 0)
+    out value: scan.value
+}
+
+-- 说明：解析一个 JSON 值，返回 { value, pos, ok }。
+station parse_value(text_value, _pos) {
+    ~idx: skip_json_space(text_value: text_value, _pos: _pos)
+    ~ch: json_char(text_value: text_value, _pos: idx)
+    when ch is "{" {
+        out value: parse_object(text_value: text_value, _pos: idx + 1)
+    } otherwise when ch is "[" {
+        out value: parse_array(text_value: text_value, _pos: idx + 1)
+    } otherwise when ch is "\"" {
+        out value: parse_string(text_value: text_value, _pos: idx + 1)
+    } otherwise when ch is "t" {
+        out value: json_literal(text_value: text_value, _pos: idx, want: "true", value: on)
+    } otherwise when ch is "f" {
+        out value: json_literal(text_value: text_value, _pos: idx, want: "false", value: off)
+    } otherwise when ch is "n" {
+        out value: json_literal(text_value: text_value, _pos: idx, want: "null", value: nothing)
+    } otherwise {
+        out value: parse_number_at(text_value: text_value, _pos: idx)
+    }
+}
+
+-- 说明：取一个字符（越界返回空串）。
+station json_char(text_value, _pos) {
+    ~acc: ""
+    when _pos atleast 0 {
+        when _pos below len(value: text_value) {
+            emit acc: at(items: text_value, index: _pos)
+        }
+    }
+    out value: acc
+}
+
+-- 说明：跳过空白。
+station skip_json_space(text_value, _pos) {
+    ~idx: _pos
+    cycle while idx below len(value: text_value) {
+        ~ch: at(items: text_value, index: idx)
+        ~go: off
+        when ch is " " { emit go: on }
+        when ch is "\t" { emit go: on }
+        when ch is "\n" { emit go: on }
+        when ch is "\r" { emit go: on }
+        when not go { halt }
+        emit idx: idx + 1
+    }
+    out value: idx
+}
+
+-- 说明：匹配字面量（true / false / null）。
+station json_literal(text_value, _pos, want, value) {
+    ~length: len(value: want)
+    ~window: slice(items: text_value, from: _pos, to: _pos + length)
+    ~ok: off
+    when window is want { emit ok: on }
+    out value: assembly{ value: value, pos: _pos + length, ok: ok }
+}
+
+-- 说明：解析对象 → 内部装配体。
+station parse_object(text_value, _pos) {
+    ~pairs: []
+    ~idx: skip_json_space(text_value: text_value, _pos: _pos)
+    ~done: off
+    cycle while not done {
+        ~ch: json_char(text_value: text_value, _pos: idx)
+        when ch is "}" {
+            emit done: on
+            emit idx: idx + 1
+        } otherwise when ch is "" {
+            emit done: on
+        } otherwise {
+            ~key_scan: parse_string(text_value: text_value, _pos: idx + 1)
+            ~key: key_scan.value
+            ~after_key: skip_json_space(text_value: text_value, _pos: key_scan.pos)
+            ~colon: skip_json_space(text_value: text_value, _pos: after_key + 1)
+            ~item: parse_value(text_value: text_value, _pos: colon)
+            emit pairs: push(into: pairs, value: [key, item.value])
+            ~after: skip_json_space(text_value: text_value, _pos: item.pos)
+            ~comma: json_char(text_value: text_value, _pos: after)
+            when comma is "," {
+                emit idx: skip_json_space(text_value: text_value, _pos: after + 1)
+            } otherwise {
+                emit idx: after
+            }
+        }
+    }
+    out value: assembly{ value: asm_make(pairs: pairs), pos: idx, ok: on }
+}
+
+-- 说明：解析数组 → 内部列表。
+station parse_array(text_value, _pos) {
+    ~items: []
+    ~idx: skip_json_space(text_value: text_value, _pos: _pos)
+    ~done: off
+    cycle while not done {
+        ~ch: json_char(text_value: text_value, _pos: idx)
+        when ch is "]" {
+            emit done: on
+            emit idx: idx + 1
+        } otherwise when ch is "" {
+            emit done: on
+        } otherwise {
+            ~item: parse_value(text_value: text_value, _pos: idx)
+            emit items: push(into: items, value: item.value)
+            ~after: skip_json_space(text_value: text_value, _pos: item.pos)
+            ~comma: json_char(text_value: text_value, _pos: after)
+            when comma is "," {
+                emit idx: skip_json_space(text_value: text_value, _pos: after + 1)
+            } otherwise {
+                emit idx: after
+            }
+        }
+    }
+    out value: assembly{ value: items, pos: idx, ok: on }
+}
+
+-- 说明：解析字符串（不带开引号）。
+station parse_string(text_value, _pos) {
+    ~chars: []
+    ~idx: _pos
+    ~done: off
+    cycle while not done {
+        ~ch: json_char(text_value: text_value, _pos: idx)
+        when ch is "\"" {
+            emit done: on
+            emit idx: idx + 1
+        } otherwise when ch is "" {
+            emit done: on
+        } otherwise when ch is "\\" {
+            ~esc: json_char(text_value: text_value, _pos: idx + 1)
+            ~decoded: esc
+            when esc is "n" { emit decoded: "\n" }
+            when esc is "t" { emit decoded: "\t" }
+            when esc is "r" { emit decoded: "\r" }
+            when esc is "\"" { emit decoded: "\"" }
+            when esc is "\\" { emit decoded: "\\" }
+            when esc is "/" { emit decoded: "/" }
+            when esc is "u" {
+                ~hex: slice(items: text_value, from: idx + 2, to: idx + 6)
+                emit decoded: unicode_char(hex: hex)
+                emit idx: idx + 4
+            }
+            emit chars: push(into: chars, value: decoded)
+            emit idx: idx + 2
+        } otherwise {
+            emit chars: push(into: chars, value: ch)
+            emit idx: idx + 1
+        }
+    }
+    out value: assembly{ value: join(items: chars, with: ""), pos: idx, ok: on }
+}
+
+-- 说明：\uXXXX → 字符（只覆盖 BMP 的常见区段，够读 JSON 用）。
+station unicode_char(hex) {
+    ~code: 0
+    cycle over span(from: 0, to: len(value: hex)) as k {
+        ~digit: hex_digit(ch: at(items: hex, index: k))
+        when digit atleast 0 { emit code: code * 16 + digit }
+    }
+    out value: number_to_char(code: code)
+}
+
+-- 说明：16 进制单字符数值。
+station hex_digit(ch) {
+    ~acc: -1
+    ~k: 0
+    cycle while k below 16 {
+        when at(items: "0123456789abcdef", index: k) is ch { emit acc: k }
+        when at(items: "0123456789ABCDEF", index: k) is ch { emit acc: k }
+        emit k: k + 1
+    }
+    out value: acc
+}
+
+-- 说明：码点 → 字符（借宿主 number/text 互转不可行，改用一张常用表 + 原样返回）。
+station number_to_char(code) {
+    ~acc: "?"
+    when code atleast 32 {
+        when code atmost 126 {
+            ~position: code - 32
+            emit acc: at(items: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~", index: position)
+        }
+    }
+    out value: acc
+}
+
+-- 说明：解析数字（整数 / 小数 / 指数）。
+station parse_number_at(text_value, _pos) {
+    ~idx: _pos
+    ~digits: []
+    ~kind: "int"
+    cycle while idx below len(value: text_value) {
+        ~ch: at(items: text_value, index: idx)
+        ~go: off
+        when ch atleast "0" and ch atmost "9" { emit go: on }
+        when ch is "-" { emit go: on }
+        when ch is "+" { emit go: on }
+        when ch is "." { emit go: on }
+        when ch is "e" or ch is "E" { emit go: on }
+        when not go { halt }
+        when ch is "." { emit kind: "real" }
+        when ch is "e" or ch is "E" { emit kind: "real" }
+        emit digits: push(into: digits, value: ch)
+        emit idx: idx + 1
+    }
+    ~raw: join(items: digits, with: "")
+    ~value: 0
+    when len(value: raw) above 0 {
+        emit value: number(value: raw)
+    }
+    out value: assembly{ value: value, pos: idx, ok: on }
+}

@@ -1,0 +1,1278 @@
+-- eval.mi — 自举版 MI 求值器。
+--
+-- 把 parser.mi 产出的语法树直接解释执行。MI 只有 wire 没有可变状态，所以这里
+-- 把状态显式当成值传递，全部 station 都是纯函数：
+--   环境 env = [[名字, 值] …]，线性查找、前置遮蔽
+--   求值结果 = { value, env, log }       log 是本步产生的输出行
+--   执行结果 = { env, ports, sig, retval, log }
+--     sig 为空表示继续，否则 "halt" / "skip" / "return"，由 cycle / station 消费
+--
+-- 值表示见 values.mi：解释器内部装配体是 { tag: "asm", pairs }，函数是一等值。
+--
+-- 公开端口：
+--   run_source(source)          -> { log, errors }
+--   eval_expr(nd, env, prog)    -> { value, env, log }
+--   exec_flows(flows, env, prog)-> 执行结果
+
+use "parser.mi"
+use "values.mi"
+use "builtins.mi"
+use "diag.mi"
+
+-- 说明：空环境。
+station env_empty() {
+    out value: []
+}
+
+-- 说明：环境查名字，返回 { ok, value }。
+station env_get(env, name) {
+    ~found: assembly{ ok: off, value: nothing }
+    cycle over env as pair {
+        when at(items: pair, index: 0) is name {
+            emit found: assembly{ ok: on, value: at(items: pair, index: 1) }
+        }
+    }
+    out value: found
+}
+
+-- 说明：环境写入（同名替换最前一条，否则插到最前）。
+station env_set(env, name, value) {
+    ~done: off
+    ~acc: []
+    cycle over env as pair {
+        when not done and at(items: pair, index: 0) is name {
+            emit done: on
+            emit acc: push(into: acc, value: [name, value])
+        } otherwise {
+            emit acc: push(into: acc, value: pair)
+        }
+    }
+    when not done {
+        emit acc: push(into: acc, value: [name, value])
+    }
+    out value: acc
+}
+
+-- 说明：批量写入环境。
+station env_push(env, pairs) {
+    ~acc: env
+    cycle over pairs as pair {
+        emit acc: env_set(env: acc, name: at(items: pair, index: 0), value: at(items: pair, index: 1))
+    }
+    out value: acc
+}
+
+-- 说明：收集 station 定义，供调用点按名字查找。
+station collect_defs(items) {
+    ~stations: []
+    cycle over items as item {
+        when item.n is "station" {
+            emit stations: push(into: stations, value: item)
+        }
+    }
+    out value: assembly{ stations: stations }
+}
+
+-- 说明：按名字找 station 定义。
+station find_station(prog, name) {
+    ~found: nothing
+    cycle over prog.stations as item {
+        when item.name is name { emit found: item }
+    }
+    out value: found
+}
+
+-- 说明：造一个可调用的名字值（内部装配体，字段 kind/name）。
+station derive_named(kind, name) {
+    out value: asm_make(pairs: [["kind", kind], ["name", name]])
+}
+
+-- 说明：造一个求值结果（带输出行与错误）。
+station ev(value, env, log) {
+    out value: assembly{ value: value, env: env, log: log, err: nothing }
+}
+
+-- 说明：造一个错误结果。
+station ev_err(code, message) {
+    out value: assembly{
+        value: nothing,
+        env: [],
+        log: [],
+        err: assembly{ code: code, message: message }
+    }
+}
+
+-- 说明：该结果是否已经是错误。
+station has_err(result) {
+    ~hit: off
+    when result.err isnot nothing { emit hit: on }
+    out value: hit
+}
+
+-- ================================================================== 表达式
+
+-- 说明：求值一个语法节点。
+station eval_expr(nd, env, prog) {
+    ~tag: nd.n
+    when tag is "num" {
+        out value: ev(value: nd.value, env: env, log: [])
+    } otherwise when tag is "text" {
+        out value: ev(value: nd.value, env: env, log: [])
+    } otherwise when tag is "flag" {
+        out value: ev(value: nd.value, env: env, log: [])
+    } otherwise when tag is "nil" {
+        out value: ev(value: nothing, env: env, log: [])
+    } otherwise when tag is "list" {
+        out value: eval_list(items: nd.items, env: env, prog: prog)
+    } otherwise when tag is "asm" {
+        out value: eval_asm(fields: nd.fields, env: env, prog: prog)
+    } otherwise when tag is "name" {
+        out value: eval_name(nd: nd, env: env, prog: prog)
+    } otherwise when tag is "read" {
+        out value: eval_name(nd: assembly{ name: nd.name, glyph: off }, env: env, prog: prog)
+    } otherwise when tag is "field" {
+        out value: eval_field(nd: nd, env: env, prog: prog)
+    } otherwise when tag is "un" {
+        ~operand: eval_expr(nd: nd.operand, env: env, prog: prog)
+        out value: ev(value: apply_un(op: nd.op, operand: operand.value), env: operand.env, log: operand.log)
+    } otherwise when tag is "bin" {
+        out value: eval_bin(nd: nd, env: env, prog: prog)
+    } otherwise when tag is "call" {
+        out value: eval_call_nd(nd: nd, env: env, prog: prog)
+    } otherwise {
+        out value: ev(value: nothing, env: env, log: [])
+    }
+}
+
+-- 说明：列表字面量。
+station eval_list(items, env, prog) {
+    ~acc: []
+    ~scope: env
+    ~log: []
+    cycle over items as item {
+        ~ran: eval_expr(nd: item, env: scope, prog: prog)
+        emit acc: push(into: acc, value: ran.value)
+        emit scope: ran.env
+        emit log: log_concat(a: log, b: ran.log)
+    }
+    out value: ev(value: acc, env: scope, log: log)
+}
+
+-- 说明：装配体字面量。
+station eval_asm(fields, env, prog) {
+    ~pairs: []
+    ~scope: env
+    ~log: []
+    cycle over fields as field {
+        ~ran: eval_expr(nd: field.value, env: scope, prog: prog)
+        emit pairs: push(into: pairs, value: [field.name, ran.value])
+        emit scope: ran.env
+        emit log: log_concat(a: log, b: ran.log)
+    }
+    out value: ev(value: asm_make(pairs: pairs), env: scope, log: log)
+}
+
+-- 说明：名字：环境 → 内置 → station → 未定义。
+station eval_name(nd, env, prog) {
+    ~name: nd.name
+    ~hit: env_get(env: env, name: name)
+    when hit.ok {
+        out value: ev(value: hit.value, env: env, log: [])
+    } otherwise when builtin_exists(name: name) {
+        out value: ev(value: derive_named(kind: "builtin", name: canonical_builtin(name: name)), env: env, log: [])
+    } otherwise when find_station(prog: prog, name: name) isnot nothing {
+        out value: ev(value: derive_named(kind: "station", name: name), env: env, log: [])
+    } otherwise {
+        out value: ev(value: derive_named(kind: "undefined", name: name), env: env, log: [])
+    }
+}
+
+-- 说明：取字段（只支持内部装配体；宿主装配体已统一成内部表示）。
+-- 缺字段时给出 E0302（与 Python 运行时的 port-not-emitted 一致）。
+station eval_field(nd, env, prog) {
+    ~base: eval_expr(nd: nd.base, env: env, prog: prog)
+    when field_missing(base: base, name: nd.name) {
+        out value: ev_err(code: "E0302", message: "this assembly has no field `" + nd.name + "`")
+    } otherwise {
+        ~result: nothing
+        when is_asm(value: base.value) {
+            emit result: asm_get(asm: base.value, name: nd.name)
+        }
+        out value: ev(value: result, env: base.env, log: base.log)
+    }
+}
+
+-- 说明：取字段是否一定失败（非装配体，或内部装配体缺字段）。
+station field_missing(base, name) {
+    ~hit: off
+    when has_err(result: base) { emit hit: off }
+    ~shape: kind_of(value: base.value)
+    when shape isnot "assembly" and shape isnot "station" and shape isnot "builtin" {
+        when shape isnot "nothing" { emit hit: on }
+    }
+    when is_asm(value: base.value) {
+        when not asm_has(asm: base.value, name: name) { emit hit: on }
+    }
+    out value: hit
+}
+
+-- 说明：二元运算，and/or 短路。
+station eval_bin(nd, env, prog) {
+    ~lhs: eval_expr(nd: nd.lhs, env: env, prog: prog)
+    ~op: nd.op
+    when op is "AND" or op is "OR" {
+        when op is "AND" and not truthy(value: lhs.value) {
+            out value: ev(value: lhs.value, env: lhs.env, log: lhs.log)
+        } otherwise when op is "OR" and truthy(value: lhs.value) {
+            out value: ev(value: lhs.value, env: lhs.env, log: lhs.log)
+        } otherwise {
+            ~rhs: eval_expr(nd: nd.rhs, env: lhs.env, prog: prog)
+            out value: ev(value: rhs.value, env: rhs.env, log: log_concat(a: lhs.log, b: rhs.log))
+        }
+    } otherwise {
+        ~rhs: eval_expr(nd: nd.rhs, env: lhs.env, prog: prog)
+        out value: ev(value: apply_bin(op: op, left: lhs.value, right: rhs.value), env: rhs.env, log: log_concat(a: lhs.log, b: rhs.log))
+    }
+}
+
+-- 说明：调用：实参求值后分派到内置或 station。
+station eval_call_nd(nd, env, prog) {
+    -- 名字恰好是变量/参数时，这是「值调用」：值不可调用就报 E0303。
+    -- 注意 MI 里 out 端口只保留最后一次写入，所以这里必须用 when/otherwise
+    -- 分支而不是提前 return。
+    ~hold: env_get(env: env, name: nd.name)
+    when nd.callee is nothing and nd.name isnot "" and hold.ok and not is_asm(value: hold.value) {
+        out value: ev_err(code: "E0303", message: "`" + nd.name + "` is not callable")
+    } otherwise {
+        out value: call_with_args(nd: nd, env: env, prog: prog)
+    }
+}
+
+-- 说明：求值实参并分派调用。
+station call_with_args(nd, env, prog) {
+    ~args: []
+    ~scope: env
+    ~log: []
+    ~failure: nothing
+    cycle over nd.args as arg {
+        when failure is nothing {
+            ~ran: eval_expr(nd: arg.value, env: scope, prog: prog)
+            emit args: push(into: args, value: assembly{ label: arg.label, value: ran.value })
+            emit scope: ran.env
+            emit log: log_concat(a: log, b: ran.log)
+            when has_err(result: ran) { emit failure: ran.err }
+        }
+    }
+    when failure isnot nothing {
+        out value: assembly{ value: nothing, env: scope, log: log, err: failure }
+    } otherwise {
+        out value: dispatch_call(nd: nd, args: args, env: scope, prog: prog, log: log)
+    }
+}
+
+-- 说明：实参就绪后分派调用。
+station dispatch_call(nd, args, env, prog, log) {
+    ~callee: nothing
+    ~scope: env
+    ~acc_log: log
+    when nd.callee isnot nothing {
+        ~ran: eval_expr(nd: nd.callee, env: env, prog: prog)
+        emit callee: ran.value
+        emit acc_log: log_concat(a: log, b: ran.log)
+    }
+    ~outcome: call_value(callee: callee, name: nd.name, args: args, env: scope, prog: prog)
+    ~inner: run_err(ran: outcome)
+    ~acc: ev(value: outcome.value, env: scope, log: log_concat(a: acc_log, b: outcome.log))
+    when inner isnot nothing {
+        emit acc: assembly{ value: nothing, env: scope, log: acc.log, err: inner }
+    }
+    out value: acc
+}
+
+-- 说明：调用分派（内置 / station / 未定义）。
+station call_value(callee, name, args, env, prog) {
+    ~result: assembly{ value: nothing, log: [] }
+    when callee isnot nothing {
+        ~label: ""
+        ~target: nothing
+        when is_asm(value: callee) {
+            emit label: asm_get(asm: callee, name: "kind")
+            emit target: asm_get(asm: callee, name: "name")
+        }
+        when label is "station" {
+            out value: call_station(name: target, args: args, env: env, prog: prog)
+        } otherwise when label is "builtin" {
+            out value: call_builtin(name: target, args: args, env: env, prog: prog)
+        } otherwise {
+            out value: result
+        }
+    } otherwise when builtin_exists(name: name) {
+        out value: call_builtin(name: canonical_builtin(name: name), args: args, env: env, prog: prog)
+    } otherwise when find_station(prog: prog, name: name) isnot nothing {
+        out value: call_station(name: name, args: args, env: env, prog: prog)
+    } otherwise {
+        out value: result
+    }
+}
+
+-- 说明：调用 station：绑定参数 → 执行块 → 按端口数收敛。
+-- `return 值` 等价于往 `value` 端口写值（与 Python 运行时一致）。
+station call_station(name, args, env, prog) {
+    ~decl: find_station(prog: prog, name: name)
+    ~result: assembly{ value: nothing, log: [] }
+    when decl isnot nothing {
+        ~bound: bind_params(params: decl.params, args: args, env: env, prog: prog)
+        ~ran: exec_flows(flows: decl.body, env: env_push(env: env_empty(), pairs: bound), prog: prog)
+        ~ports: run_ports(ran: ran)
+        when ran.sig is "return" {
+            emit ports: [["value", ran.retval]]
+        }
+        emit result: assembly{ value: station_result(ports: ports), log: ran.log, err: run_err(ran: ran) }
+    }
+    out value: result
+}
+
+-- 说明：绑定实参（标签优先，其次位置，最后默认值），返回 [[名字, 值] …]。
+station bind_params(params, args, env, prog) {
+    ~pairs: []
+    ~used: []
+    ~slot: 0
+    cycle over params as param {
+        ~chosen: nothing
+        ~bound: off
+        ~k: 0
+        cycle while k below len(value: args) {
+            ~arg: at(items: args, index: k)
+            when not bound and arg.label isnot nothing and arg.label is param.name {
+                emit chosen: arg.value
+                emit bound: on
+                emit used: push(into: used, value: k)
+            }
+            emit k: k + 1
+        }
+        ~j: 0
+        cycle while j below len(value: args) {
+            ~arg: at(items: args, index: j)
+            when not bound and arg.label is nothing {
+                when not has(container: used, value: j) and j atleast slot {
+                    emit chosen: arg.value
+                    emit bound: on
+                    emit used: push(into: used, value: j)
+                    emit slot: j + 1
+                }
+            }
+            emit j: j + 1
+        }
+        when not bound and param.def isnot nothing {
+            ~ran: eval_expr(nd: param.def, env: env, prog: prog)
+            emit chosen: ran.value
+        }
+        emit pairs: push(into: pairs, value: [param.name, chosen])
+    }
+    out value: pairs
+}
+
+-- 说明：安全读取执行结果的端口（旧形状没有该字段时返回空表）。
+station run_ports(ran) {
+    ~acc: []
+    when has(container: ran, value: "ports") { emit acc: ran.ports }
+    out value: acc
+}
+
+-- 说明：安全读取执行结果的错误。
+station run_err(ran) {
+    ~acc: nothing
+    when has(container: ran, value: "err") { emit acc: ran.err }
+    out value: acc
+}
+
+-- 说明：按端口把结果收敛成值（0 端口 nothing、1 端口直出、多端口装配体）。
+station station_result(ports) {
+    ~names: []
+    ~values: []
+    cycle over ports as port {
+        emit names: push(into: names, value: at(items: port, index: 0))
+        emit values: push(into: values, value: at(items: port, index: 1))
+    }
+    ~count: len(value: names)
+    ~result: nothing
+    when count is 1 {
+        emit result: at(items: values, index: 0)
+    } otherwise when count above 1 {
+        ~pairs: []
+        cycle over span(from: 0, to: count) as k {
+            emit pairs: push(into: pairs, value: [at(items: names, index: k), at(items: values, index: k)])
+        }
+        emit result: asm_make(pairs: pairs)
+    }
+    out value: result
+}
+
+-- ==================================================================== 语句
+
+-- 说明：执行一串语句。
+station exec_flows(flows, env, prog) {
+    ~scope: env
+    ~ports: []
+    ~sig: ""
+    ~retval: nothing
+    ~log: []
+    ~stopped: off
+    ~failure: nothing
+    cycle over flows as flow {
+        when not stopped {
+            ~ran: exec_flow(flow: flow, env: scope, prog: prog)
+            emit scope: ran.env
+            emit ports: list_concat(a: ports, b: ran.ports)
+            emit log: log_concat(a: log, b: ran.log)
+            when len(value: ran.sig) above 0 {
+                emit sig: ran.sig
+                emit retval: ran.retval
+                emit stopped: on
+            }
+            when run_err(ran: ran) isnot nothing {
+                emit failure: ran.err
+                emit stopped: on
+            }
+        }
+    }
+    out value: assembly{
+        env: scope, ports: ports, sig: sig, retval: retval, log: log, err: failure
+    }
+}
+
+-- 说明：把表达式结果转成语句结果（出错时带上错误）。
+station flow_step(ran) {
+    ~acc: step(env: ran.env, ports: [], log: ran.log)
+    when has_err(result: ran) {
+        emit acc: step_err(code: ran.err.code, message: ran.err.message, log: ran.log)
+    }
+    out value: acc
+}
+
+-- 说明：普通语句结果。
+station step(env, ports, log) {
+    out value: assembly{
+        env: env, ports: ports, sig: "", retval: nothing, log: log, err: nothing
+    }
+}
+
+-- 说明：信号语句结果。
+station jump(sig, retval, log) {
+    out value: assembly{
+        env: [], ports: [], sig: sig, retval: retval, log: log, err: nothing
+    }
+}
+
+-- 说明：错误语句结果。
+station step_err(code, message, log) {
+    out value: assembly{
+        env: [],
+        ports: [],
+        sig: "",
+        retval: nothing,
+        log: log,
+        err: assembly{ code: code, message: message }
+    }
+}
+
+-- 说明：执行单条语句。
+station exec_flow(flow, env, prog) {
+    ~tag: flow.n
+    when tag is "wire" {
+        ~init: assembly{ value: nothing, env: env, log: [] }
+        when flow.init isnot nothing {
+            emit init: eval_expr(nd: flow.init, env: env, prog: prog)
+        }
+        out value: step(env: env_set(env: init.env, name: flow.name, value: init.value), ports: [], log: init.log)
+    } otherwise when tag is "emit" {
+        ~ran: eval_expr(nd: flow.value, env: env, prog: prog)
+        when has_err(result: ran) {
+            out value: step_err(code: ran.err.code, message: ran.err.message, log: ran.log)
+        } otherwise {
+            out value: step(env: env_set(env: ran.env, name: flow.target, value: ran.value), ports: [], log: ran.log)
+        }
+    } otherwise when tag is "out" {
+        ~ran: eval_expr(nd: flow.value, env: env, prog: prog)
+        when has_err(result: ran) {
+            out value: step_err(code: ran.err.code, message: ran.err.message, log: ran.log)
+        } otherwise {
+            out value: step(env: ran.env, ports: [[flow.name, ran.value]], log: ran.log)
+        }
+    } otherwise when tag is "flow" {
+        ~ran: eval_expr(nd: flow.expr, env: env, prog: prog)
+        out value: flow_step(ran: ran)
+    } otherwise when tag is "halt" {
+        out value: jump(sig: "halt", retval: nothing, log: [])
+    } otherwise when tag is "skip" {
+        out value: jump(sig: "skip", retval: nothing, log: [])
+    } otherwise when tag is "return" {
+        ~ran: eval_expr(nd: flow.value, env: env, prog: prog)
+        out value: jump(sig: "return", retval: ran.value, log: ran.log)
+    } otherwise when tag is "when" {
+        out value: exec_when(flow: flow, env: env, prog: prog)
+    } otherwise when tag is "cycle" {
+        out value: exec_cycle(flow: flow, env: env, prog: prog)
+    } otherwise when tag is "for" {
+        out value: exec_for(flow: flow, env: env, prog: prog)
+    } otherwise {
+        out value: step(env: env, ports: [], log: [])
+    }
+}
+
+-- 说明：when 分支。
+station exec_when(flow, env, prog) {
+    ~cond: eval_expr(nd: flow.cond, env: env, prog: prog)
+    ~result: step(env: cond.env, ports: [], log: cond.log)
+    when truthy(value: cond.value) {
+        ~ran: exec_flows(flows: flow.body, env: cond.env, prog: prog)
+        emit result: ran
+    } otherwise when flow.other isnot nothing {
+        when flow.other.n is "block" {
+            ~ran: exec_flows(flows: flow.other.body, env: cond.env, prog: prog)
+            emit result: ran
+        } otherwise {
+            ~ran: exec_flow(flow: flow.other, env: cond.env, prog: prog)
+            emit result: ran
+        }
+    }
+    out value: result
+}
+
+-- 说明：cycle（count / while / until / over）。
+station exec_cycle(flow, env, prog) {
+    ~kind: flow.ckind
+    when kind is "count" {
+        ~head: eval_expr(nd: flow.head, env: env, prog: prog)
+        out value: loop_count(flow: flow, env: head.env, prog: prog, count: head.value, log: head.log)
+    } otherwise when kind is "over" {
+        ~head: eval_expr(nd: flow.head, env: env, prog: prog)
+        out value: loop_over(flow: flow, env: head.env, prog: prog, items: head.value, log: head.log)
+    } otherwise {
+        out value: loop_while(flow: flow, env: env, prog: prog, kind: kind)
+    }
+}
+
+-- 说明：计数循环。
+station loop_count(flow, env, prog, count, log) {
+    ~idx: 0
+    ~scope: env
+    ~sig: ""
+    ~retval: nothing
+    ~acc: log
+    ~stopped: off
+    cycle while idx below count {
+        when stopped { halt }
+        ~inner: scope
+        when flow.var isnot nothing {
+            emit inner: env_set(env: scope, name: flow.var, value: idx)
+        }
+        ~ran: exec_flows(flows: flow.body, env: inner, prog: prog)
+        emit scope: ran.env
+        emit acc: log_concat(a: acc, b: ran.log)
+        when ran.sig is "halt" { emit stopped: on }
+        when ran.sig is "return" {
+            emit sig: ran.sig
+            emit retval: ran.retval
+            emit stopped: on
+        }
+        emit idx: idx + 1
+    }
+    out value: assembly{ env: scope, ports: [], sig: sig, retval: retval, log: acc, err: nothing }
+}
+
+-- 说明：遍历循环。
+station loop_over(flow, env, prog, items, log) {
+    ~idx: 0
+    ~scope: env
+    ~sig: ""
+    ~retval: nothing
+    ~acc: log
+    ~stopped: off
+    ~n: len(value: items)
+    cycle while idx below n {
+        when stopped { halt }
+        ~inner: scope
+        when flow.var isnot nothing {
+            emit inner: env_set(env: scope, name: flow.var, value: at(items: items, index: idx))
+        }
+        ~ran: exec_flows(flows: flow.body, env: inner, prog: prog)
+        emit scope: ran.env
+        emit acc: log_concat(a: acc, b: ran.log)
+        when ran.sig is "halt" { emit stopped: on }
+        when ran.sig is "return" {
+            emit sig: ran.sig
+            emit retval: ran.retval
+            emit stopped: on
+        }
+        emit idx: idx + 1
+    }
+    out value: assembly{ env: scope, ports: [], sig: sig, retval: retval, log: acc, err: nothing }
+}
+
+-- 说明：while / until 循环（条件每轮在最新环境里重新求值）。
+station loop_while(flow, env, prog, kind) {
+    ~scope: env
+    ~sig: ""
+    ~retval: nothing
+    ~acc: []
+    ~stopped: off
+    ~guard: 0
+    cycle while guard below 1000000 {
+        when stopped { halt }
+        ~cond: eval_expr(nd: flow.head, env: scope, prog: prog)
+        ~go: on
+        when kind is "while" and not truthy(value: cond.value) { emit go: off }
+        when kind is "until" and truthy(value: cond.value) { emit go: off }
+        when not go { emit stopped: on }
+        when go {
+            ~ran: exec_flows(flows: flow.body, env: cond.env, prog: prog)
+            emit scope: ran.env
+            emit acc: log_concat(a: acc, b: ran.log)
+            when ran.sig is "halt" { emit stopped: on }
+            when ran.sig is "return" {
+                emit sig: ran.sig
+                emit retval: ran.retval
+                emit stopped: on
+            }
+        }
+        emit guard: guard + 1
+    }
+    out value: assembly{ env: scope, ports: [], sig: sig, retval: retval, log: acc, err: nothing }
+}
+
+-- 说明：for 循环（借遍历循环实现）。
+station exec_for(flow, env, prog) {
+    ~items: eval_expr(nd: flow.items, env: env, prog: prog)
+    out value: loop_over(flow: assembly{ var: flow.var, body: flow.body }, env: items.env, prog: prog, items: items.value, log: items.log)
+}
+
+-- ============================================================== 内置函数分派
+
+-- 说明：调用内置函数（按规范名分派）。原样返回 { value, log, err }。
+station call_builtin(name, args, env, prog) {
+    ~result: builtin_value(name: name, args: args, env: env, prog: prog)
+    out value: result
+}
+
+-- 说明：内置函数体：返回值与输出行。
+station call_builtin_nd(name, args, env, prog) {
+    ~outcome: builtin_value(name: name, args: args, env: env, prog: prog)
+    out value: outcome
+}
+
+-- 说明：按名字求值内置函数。
+station builtin_value(name, args, env, prog) {
+    ~result: assembly{ value: nothing, log: [] }
+    when name is "show" {
+        ~line_parts: []
+        cycle over args as item {
+            emit line_parts: push(into: line_parts, value: display_of(value: item.value))
+        }
+        emit result: assembly{ value: nothing, log: [join(items: line_parts, with: " ")] }
+    } otherwise when name is "len" {
+        ~target: pick(args: args, wanted: "value", _slot: 0)
+        emit result: builtin_reply(value: length_of(value: target))
+    } otherwise when name is "push" {
+        ~into: pick(args: args, wanted: "into", _slot: 0)
+        ~item: pick(args: args, wanted: "value", _slot: 1)
+        emit result: builtin_reply(value: list_concat(a: into, b: [item]))
+    } otherwise when name is "at" {
+        ~items: pick(args: args, wanted: "items", _slot: 0)
+        ~idx: pick(args: args, wanted: "index", _slot: 1)
+        emit result: builtin_reply(value: bi_at(items: items, idx: as_int_value(value: idx)))
+    } otherwise when name is "slice" {
+        ~items: pick(args: args, wanted: "items", _slot: 0)
+        ~lo: pick(args: args, wanted: "from", _slot: 1)
+        ~hi: pick(args: args, wanted: "to", _slot: 2)
+        ~lo_int: as_int_value(value: lo)
+        ~hi_int: length_of(value: items)
+        when hi isnot nothing { emit hi_int: as_int_value(value: hi) }
+        emit result: builtin_reply(value: bi_slice(items: items, from_idx: lo_int, to_idx: hi_int))
+    } otherwise when name is "span" {
+        ~lo: pick(args: args, wanted: "from", _slot: 0)
+        ~hi: pick(args: args, wanted: "to", _slot: 1)
+        ~by: pick(args: args, wanted: "step", _slot: 2)
+        ~step: 1
+        when by isnot nothing { emit step: as_int_value(value: by) }
+        emit result: builtin_reply(value: bi_span(from_idx: as_int_value(value: lo), to_idx: as_int_value(value: hi), step: step))
+    } otherwise when name is "join" {
+        ~items: pick(args: args, wanted: "items", _slot: 0)
+        ~sep: pick(args: args, wanted: "with", _slot: 1)
+        ~separator: ""
+        when sep isnot nothing { emit separator: text_of(value: sep) }
+        emit result: builtin_reply(value: bi_join(items: items, separator: separator))
+    } otherwise when name is "split" {
+        ~text_value: pick(args: args, wanted: "text", _slot: 0)
+        ~separator: pick(args: args, wanted: "at", _slot: 1)
+        emit result: builtin_reply(value: bi_split(text_value: text_of(value: text_value), separator: text_of(value: separator)))
+    } otherwise when name is "text" {
+        emit result: builtin_reply(value: text_of(value: pick(args: args, wanted: "value", _slot: 0)))
+    } otherwise when name is "number" {
+        emit result: builtin_reply(value: bi_number(value: pick(args: args, wanted: "value", _slot: 0)))
+    } otherwise when name is "kind" {
+        emit result: builtin_reply(value: bi_kind(value: pick(args: args, wanted: "value", _slot: 0)))
+    } otherwise when name is "has" {
+        ~container: pick(args: args, wanted: "container", _slot: 0)
+        ~value: pick(args: args, wanted: "value", _slot: 1)
+        emit result: builtin_reply(value: bi_has(container: container, value: value))
+    } otherwise when name is "keys" {
+        emit result: builtin_reply(value: bi_keys(asm: pick(args: args, wanted: "target", _slot: 0)))
+    } otherwise when name is "place" {
+        ~target: pick(args: args, wanted: "target", _slot: 0)
+        ~field: text_of(value: pick(args: args, wanted: "field", _slot: 1))
+        ~value: pick(args: args, wanted: "value", _slot: 2)
+        emit result: builtin_reply(value: bi_place(asm: target, field: field, value: value))
+    } otherwise when name is "list" {
+        emit result: builtin_reply(value: bi_list(args: args))
+    } otherwise when name is "sort" {
+        emit result: builtin_reply(value: bi_sort(items: pick(args: args, wanted: "items", _slot: 0)))
+    } otherwise when name is "reverse" {
+        emit result: builtin_reply(value: bi_reverse(items: pick(args: args, wanted: "items", _slot: 0)))
+    } otherwise when name is "abs" {
+        emit result: builtin_reply(value: bi_abs(value: as_number_value(value: pick(args: args, wanted: "value", _slot: 0))))
+    } otherwise when name is "floor" {
+        emit result: builtin_reply(value: bi_floor(value: as_number_value(value: pick(args: args, wanted: "value", _slot: 0))))
+    } otherwise when name is "ceil" {
+        emit result: builtin_reply(value: bi_ceil(value: as_number_value(value: pick(args: args, wanted: "value", _slot: 0))))
+    } otherwise when name is "round" {
+        ~digits: pick(args: args, wanted: "digits", _slot: 1)
+        ~rounded: bi_round(value: as_number_value(value: pick(args: args, wanted: "value", _slot: 0)))
+        when digits isnot nothing {
+            emit rounded: bi_round_digits(value: as_number_value(value: pick(args: args, wanted: "value", _slot: 0)), digits: as_int_value(value: digits))
+        }
+        emit result: builtin_reply(value: rounded)
+    } otherwise when name is "sqrt" {
+        emit result: builtin_reply(value: bi_sqrt(value: as_number_value(value: pick(args: args, wanted: "value", _slot: 0))))
+    } otherwise when name is "min" {
+        emit result: builtin_reply(value: bi_extreme(args: args, want_min: on))
+    } otherwise when name is "max" {
+        emit result: builtin_reply(value: bi_extreme(args: args, want_min: off))
+    } otherwise when name is "map" {
+        emit result: builtin_reply(value: bi_map(args: args, env: env, prog: prog))
+    } otherwise when name is "filter" {
+        emit result: builtin_reply(value: bi_filter(args: args, env: env, prog: prog))
+    } otherwise when name is "fold" {
+        emit result: builtin_reply(value: bi_fold(args: args, env: env, prog: prog))
+    } otherwise when name is "json.text" {
+        emit result: builtin_reply(value: bi_json_text(value: pick(args: args, wanted: "value", _slot: 0)))
+    } otherwise when name is "json.parse" {
+        emit result: builtin_reply(value: bi_json_parse(text_value: text_of(value: pick(args: args, wanted: "text", _slot: 0))))
+    } otherwise when name is "fs.read" {
+        -- 例外：`use` 的模块加载要用它，所以自举版把这两个宿主函数接进来（只读）。
+        emit result: builtin_reply(value: to_host_fs_read(path: text_of(value: pick(args: args, wanted: "path", _slot: 0))))
+    } otherwise when name is "fs.exists" {
+        emit result: builtin_reply(value: to_host_fs_exists(path: text_of(value: pick(args: args, wanted: "path", _slot: 0))))
+    } otherwise when needs_host(name: name) {
+        -- 其余宿主函数：真的去调宿主（自举版本身就跑在宿主之上），
+        -- 再把返回值转回内部表示。宿主缺这个能力时才报 E0301。
+        emit result: call_host(name: name, args: args)
+    } otherwise {
+        emit result: assembly{ value: nothing, log: [] }
+    }
+    out value: result
+}
+
+-- 说明：接宿主 `fs.read`（自举版跑在 Python 宿主之上）。
+-- 注意：不能写 `fs.read(path: path)` —— 那会被解释成调用自己（无限递归），
+-- 必须借宿主名字 `fs.load`（同一内置的另一个拼写，宿主直接提供）。
+station to_host_fs_read(path) {
+    out value: fs.load(path: path)
+}
+
+-- 说明：接宿主 `fs.exists`（用别名 `fs.has` 避开自举版自己的分派）。
+station to_host_fs_exists(path) {
+    out value: fs.has(path: path)
+}
+
+-- ======================================================== 宿主函数桥接表
+-- 自举版由宿主解释执行，所以它**能**调用宿主的全部内置函数；差别只在
+-- 「谁的命令」。这里按名字分派到宿主，返回值用 from_host 转成内部表示。
+--
+-- 用别名（fs.load / store.save …）而不是规范名：自举版自己已经分派了
+-- fs.read / fs.exists，直接写规范名会递归调自己。
+
+-- 说明：调用一个宿主内置函数，返回 { value, log, err }。
+station call_host(name, args) {
+    ~value: nothing
+    ~failed: off
+    when name is "fs.read" {
+        emit value: fs.load(path: text_of(value: arg_of(args: args, _slot: 0)))
+    } otherwise when name is "fs.exists" {
+        emit value: fs.has(path: text_of(value: arg_of(args: args, _slot: 0)))
+    } otherwise when name is "fs.write" {
+        emit value: fs.save(path: text_of(value: arg_of(args: args, _slot: 0)), text: text_of(value: arg_of(args: args, _slot: 1)))
+    } otherwise when name is "store.read" {
+        emit value: store.load(name: text_of(value: arg_of(args: args, _slot: 0)), fallback: arg_of(args: args, _slot: 1))
+    } otherwise when name is "store.write" {
+        emit value: store.save(name: text_of(value: arg_of(args: args, _slot: 0)), value: to_host(value: arg_of(args: args, _slot: 1)))
+    } otherwise when name is "store.clear" {
+        emit value: store.wipe(name: text_of(value: arg_of(args: args, _slot: 0)))
+    } otherwise when name is "crypto.sha256" {
+        emit value: crypto.hash(text: text_of(value: arg_of(args: args, _slot: 0)))
+    } otherwise when name is "net.get" {
+        emit value: net.fetch(url: text_of(value: arg_of(args: args, _slot: 0)), safe: flag_of(value: arg_of(args: args, _slot: 1)))
+    } otherwise when name is "net.post" {
+        emit value: net.send(url: text_of(value: arg_of(args: args, _slot: 0)), body: text_of(value: arg_of(args: args, _slot: 1)), safe: flag_of(value: arg_of(args: args, _slot: 2)))
+    } otherwise when name is "env" {
+        emit value: host_env(args: args)
+    } otherwise when name is "argv" {
+        emit value: argv()
+    } otherwise when name is "clock" {
+        emit value: now()
+    } otherwise when name is "random" {
+        emit value: host_random(args: args)
+    } otherwise when name is "ask" {
+        emit value: host_ask(args: args)
+    } otherwise when name is "serve" {
+        emit value: serve(port: arg_of(args: args, _slot: 0), handler: arg_of(args: args, _slot: 1))
+    } otherwise when name is "ui.mount" {
+        emit value: host_optional0(which: "ui.mount", args: args)
+    } otherwise when name is "ui.clear" {
+        emit value: ui.wipe()
+    } otherwise when name is "ui.heading" {
+        emit value: ui.title(value: arg_of(args: args, _slot: 0))
+    } otherwise when name is "ui.text" {
+        emit value: ui.write(value: arg_of(args: args, _slot: 0))
+    } otherwise when name is "ui.input" {
+        emit value: host_two_optional(which: "ui.input", args: args)
+    } otherwise when name is "ui.value" {
+        emit value: ui.read(label: arg_of(args: args, _slot: 0))
+    } otherwise when name is "ui.button" {
+        emit value: host_three_optional(which: "ui.button", args: args)
+    } otherwise when name is "view.screen" {
+        emit value: host_two_optional(which: "view.screen", args: args)
+    } otherwise when name is "view.card" {
+        emit value: host_two_optional(which: "view.card", args: args)
+    } otherwise when name is "view.row" {
+        emit value: view.line()
+    } otherwise when name is "view.list" {
+        emit value: host_two_optional(which: "view.list", args: args)
+    } otherwise when name is "view.table" {
+        emit value: host_four_optional(which: "view.table", args: args)
+    } otherwise when name is "view.progress" {
+        emit value: host_three_optional(which: "view.progress", args: args)
+    } otherwise when name is "view.badge" {
+        emit value: host_two_optional(which: "view.badge", args: args)
+    } otherwise when name is "view.map" {
+        emit value: view.plan(cells: arg_of(args: args, _slot: 0), legend: arg_of(args: args, _slot: 1), on_click: arg_of(args: args, _slot: 2))
+    } otherwise when name is "view.image" {
+        emit value: host_two_optional(which: "view.image", args: args)
+    } otherwise when name is "view.timer" {
+        emit value: view.countdown(label: arg_of(args: args, _slot: 0), seconds: arg_of(args: args, _slot: 1), on_done: arg_of(args: args, _slot: 2))
+    } otherwise when name is "view.after" {
+        emit value: host_three_optional(which: "view.after", args: args)
+    } otherwise when name is "view.every" {
+        emit value: host_three_optional(which: "view.every", args: args)
+    } otherwise when name is "view.cancel" {
+        emit value: view.stop(handle: arg_of(args: args, _slot: 0))
+    } otherwise when name is "view.keep" {
+        emit value: view.remember(name: arg_of(args: args, _slot: 0), value: to_host(value: arg_of(args: args, _slot: 1)))
+    } otherwise when name is "view.recall" {
+        emit value: from_host(value: host_two_optional(which: "view.recall", args: args))
+    } otherwise when name is "view.notice" {
+        emit value: host_two_optional(which: "view.notice", args: args)
+    } otherwise when name is "view.confirm" {
+        emit value: host_four_optional(which: "view.confirm", args: args)
+    } otherwise {
+        emit failed: on
+    }
+    ~reply: assembly{ value: nothing, log: [] }
+    when failed {
+        emit reply: assembly{
+            value: nothing,
+            log: [],
+            err: assembly{
+                code: "E0301",
+                message: "`" + name + "` needs a host that the self-hosted runtime does not provide"
+            }
+        }
+    } otherwise {
+        emit reply: assembly{ value: from_host(value: value), log: [] }
+    }
+    out value: reply
+}
+
+-- 说明：宿主返回的真装配体 → 解释器内部表示。
+-- 借 json 往返（自举版已有自己的 json 编解码），避免依赖宿主的字段枚举。
+station from_host(value) {
+    ~acc: value
+    when kind(value: value) is "assembly" {
+        ~is_internal: off
+        when has(container: value, value: "tag") {
+            when value.tag is "asm" { emit is_internal: on }
+        }
+        when not is_internal {
+            -- 借宿主的 json.encode 编码真装配体，再用自举版自己的解析器转内部表示。
+            emit acc: bi_json_parse(text_value: json.encode(value: value))
+        }
+    }
+    out value: acc
+}
+
+-- 说明：把值当开关读（nothing → off，其余按真值规则）。
+station flag_of(value) {
+    out value: truthy(value: value)
+}
+
+-- 说明：env —— 可选 fallback 只有给了才传。
+station host_env(args) {
+    ~name: text_of(value: arg_of(args: args, _slot: 0))
+    ~fallback: arg_of(args: args, _slot: 1)
+    ~value: getenv(name: name)
+    when fallback isnot nothing { emit value: getenv(name: name, fallback: fallback) }
+    out value: value
+}
+
+-- 说明：random —— 零参 / 一参 / 两参。只做一次真正的宿主调用，
+-- 否则 `dice(from: 7)` 会因默认 `to: 1` 先炸掉（7 >= 1）。
+station host_random(args) {
+    ~low: arg_of(args: args, _slot: 0)
+    ~high: arg_of(args: args, _slot: 1)
+    ~value: dice()
+    when low isnot nothing and high isnot nothing {
+        emit value: dice(from: low, to: high)
+    } otherwise when low isnot nothing {
+        emit value: dice(from: low, to: 1)
+    }
+    out value: value
+}
+
+-- 说明：ask —— 可选 prompt 只有给了才传。
+station host_ask(args) {
+    ~prompt_text: arg_of(args: args, _slot: 0)
+    ~value: prompt()
+    when prompt_text isnot nothing { emit value: prompt(prompt: prompt_text) }
+    out value: value
+}
+
+-- 说明：零必填 + 一个可选实参的宿主函数（ui.mount）。
+station host_optional0(which, args) {
+    ~a0: arg_of(args: args, _slot: 0)
+    ~value: nothing
+    when which is "ui.mount" {
+        emit value: ui.page()
+        when a0 isnot nothing { emit value: ui.page(target: a0) }
+    }
+    out value: value
+}
+
+-- 说明：一个必填 + 一个可选的宿主函数。
+station host_two_optional(which, args) {
+    ~a0: arg_of(args: args, _slot: 0)
+    ~a1: arg_of(args: args, _slot: 1)
+    ~value: nothing
+    when which is "ui.input" {
+        emit value: ui.field(label: a0)
+        when a1 isnot nothing { emit value: ui.field(label: a0, value: a1) }
+    } otherwise when which is "view.screen" {
+        emit value: view.page(title: a0)
+        when a1 isnot nothing { emit value: view.page(title: a0, subtitle: a1) }
+    } otherwise when which is "view.card" {
+        emit value: view.panel(title: a0)
+        when a1 isnot nothing { emit value: view.panel(title: a0, subtitle: a1) }
+    } otherwise when which is "view.list" {
+        emit value: view.bullets(items: a0)
+        when a1 isnot nothing { emit value: view.bullets(items: a0, numbered: a1) }
+    } otherwise when which is "view.badge" {
+        emit value: view.tag(text: a0)
+        when a1 isnot nothing { emit value: view.tag(text: a0, tone: a1) }
+    } otherwise when which is "view.image" {
+        emit value: view.picture(path: a0)
+        when a1 isnot nothing { emit value: view.picture(path: a0, width: a1) }
+    } otherwise when which is "view.notice" {
+        emit value: view.toast(text: a0)
+        when a1 isnot nothing { emit value: view.toast(text: a0, tone: a1) }
+    } otherwise when which is "view.recall" {
+        emit value: view.restore(name: a0)
+        when a1 isnot nothing { emit value: view.restore(name: a0, fallback: a1) }
+    }
+    out value: value
+}
+
+-- 说明：两个必填 + 一个可选的宿主函数。
+station host_three_optional(which, args) {
+    ~a0: arg_of(args: args, _slot: 0)
+    ~a1: arg_of(args: args, _slot: 1)
+    ~a2: arg_of(args: args, _slot: 2)
+    ~value: nothing
+    when which is "ui.button" {
+        emit value: ui.press(label: a0, press: a1)
+        when a2 isnot nothing { emit value: ui.press(label: a0, press: a1, value: a2) }
+    } otherwise when which is "view.progress" {
+        emit value: view.bar(label: a0, value: a1)
+        when a2 isnot nothing { emit value: view.bar(label: a0, value: a1, tone: a2) }
+    } otherwise when which is "view.after" {
+        emit value: view.delay(ms: a0, action: a1)
+        when a2 isnot nothing { emit value: view.delay(ms: a0, action: a1, value: a2) }
+    } otherwise when which is "view.every" {
+        emit value: view.repeat(ms: a0, action: a1)
+        when a2 isnot nothing { emit value: view.repeat(ms: a0, action: a1, value: a2) }
+    }
+    out value: value
+}
+
+-- 说明：三个必填 + 一个可选的宿主函数。
+station host_four_optional(which, args) {
+    ~a0: arg_of(args: args, _slot: 0)
+    ~a1: arg_of(args: args, _slot: 1)
+    ~a2: arg_of(args: args, _slot: 2)
+    ~a3: arg_of(args: args, _slot: 3)
+    ~value: nothing
+    when which is "view.table" {
+        emit value: view.grid(columns: a0, rows: a1)
+        when a2 isnot nothing and a3 isnot nothing {
+            emit value: view.grid(columns: a0, rows: a1, on_click: a2, id_field: a3)
+        } otherwise when a2 isnot nothing {
+            emit value: view.grid(columns: a0, rows: a1, on_click: a2)
+        } otherwise when a3 isnot nothing {
+            emit value: view.grid(columns: a0, rows: a1, id_field: a3)
+        }
+    } otherwise when which is "view.confirm" {
+        emit value: view.ask(text: a0, on_yes: a1, on_no: a2)
+        when a3 isnot nothing { emit value: view.ask(text: a0, on_yes: a1, on_no: a2, value: a3) }
+    }
+    out value: value
+}
+
+-- 说明：内置函数结果（无输出行）。
+station builtin_reply(value) {
+    out value: assembly{ value: value, log: [] }
+}
+
+-- 说明：长度（text / list / assembly）。
+station length_of(value) {
+    ~acc: 0
+    ~shape: kind_of(value: value)
+    when shape is "text" { emit acc: len(value: value) }
+    when shape is "list" { emit acc: len(value: value) }
+    when shape is "assembly" { emit acc: len(value: value.pairs) }
+    out value: acc
+}
+
+-- 说明：数值转换（数字原样，文本转数字）。
+station as_int_value(value) {
+    ~acc: 0
+    when kind_of(value: value) is "number" { emit acc: value }
+    when kind_of(value: value) is "text" { emit acc: number(value: value) }
+    when kind_of(value: value) is "flag" {
+        emit acc: 0
+        when value { emit acc: 1 }
+    }
+    out value: acc
+}
+
+-- 说明：数学内置的数值实参（数字原样，文本转数字）。
+station as_number_value(value) {
+    ~acc: 0
+    when kind_of(value: value) is "number" { emit acc: value }
+    when kind_of(value: value) is "text" { emit acc: number(value: value) }
+    out value: acc
+}
+
+-- 说明：绝对值。
+station abs_value(value) {
+    ~acc: value
+    when value below 0 { emit acc: 0 - value }
+    out value: acc
+}
+
+-- 说明：调用一个「函数值」（内置名或 station 名）。
+station call_function(callback, args, env, prog) {
+    ~result: nothing
+    ~resolved: callback
+    when is_asm(value: callback) {
+        when asm_has(asm: callback, name: "name") { emit resolved: asm_get(asm: callback, name: "name") }
+    }
+    when kind_of(value: resolved) is "text" {
+        emit result: call_value(callee: nothing, name: resolved, args: args, env: env, prog: prog).value
+    }
+    out value: result
+}
+
+-- 说明：map(items, callback)。
+station bi_map(args, env, prog) {
+    ~items: pick(args: args, wanted: "items", _slot: 0)
+    ~callback: pick(args: args, wanted: "with", _slot: 1)
+    ~acc: []
+    cycle over items as item {
+        emit acc: push(into: acc, value: call_function(callback: callback, args: [assembly{ label: nothing, value: item }], env: env, prog: prog))
+    }
+    out value: acc
+}
+
+-- 说明：filter(items, callback)。
+station bi_filter(args, env, prog) {
+    ~items: pick(args: args, wanted: "items", _slot: 0)
+    ~callback: pick(args: args, wanted: "with", _slot: 1)
+    ~acc: []
+    cycle over items as item {
+        ~verdict: call_function(callback: callback, args: [assembly{ label: nothing, value: item }], env: env, prog: prog)
+        when truthy(value: verdict) {
+            emit acc: push(into: acc, value: item)
+        }
+    }
+    out value: acc
+}
+
+-- 说明：fold(items, seed, callback)。
+station bi_fold(args, env, prog) {
+    ~items: pick(args: args, wanted: "items", _slot: 0)
+    ~acc: pick(args: args, wanted: "seed", _slot: 1)
+    ~callback: pick(args: args, wanted: "with", _slot: 2)
+    cycle over items as item {
+        ~pair: [assembly{ label: nothing, value: acc }, assembly{ label: nothing, value: item }]
+        emit acc: call_function(callback: callback, args: pair, env: env, prog: prog)
+    }
+    out value: acc
+}
+
+-- ============================================================== 程序入口
+
+-- 说明：把 use 引入的模块并进 station 表。
+-- 模块靠 fs.read 读入、再走同一个 parser，因此模块里的 station 与主程序的
+-- 完全同权；带别名时额外登记一份 `别名.名字`，供 `num.double(…)` 调用。
+station load_modules(items, prog, origin, visited) {
+    ~stations: prog.stations
+    ~loaded: []
+    ~errors: []
+    cycle over items as item {
+        when item.n is "use" {
+            ~path: resolve_module(path: item.path, origin: origin)
+            when has(container: visited, value: path) {
+                -- 已经加载过（或遇到循环引用），跳过。
+            } otherwise when fs.exists(path: path) {
+                ~text_value: fs.read(path: path)
+                ~sub: parse(text_value)
+                ~next_visited: push(into: visited, value: path)
+                cycle over sub.items as sub_item {
+                    when sub_item.n is "station" {
+                        emit stations: push(into: stations, value: sub_item)
+                        emit loaded: push(into: loaded, value: sub_item)
+                        when item.alias isnot nothing {
+                            emit stations: push(into: stations, value: alias_station(decl: sub_item, alias: item.alias))
+                        }
+                    }
+                }
+                -- 模块里的 `use` 以「模块本身」为基准继续解析（与 Python 运行时一致）。
+                ~nested: load_modules(items: sub.items, prog: assembly{ stations: [] }, origin: path, visited: next_visited)
+                cycle over nested.stations as sub_item {
+                    emit stations: push(into: stations, value: sub_item)
+                    emit loaded: push(into: loaded, value: sub_item)
+                }
+                cycle over nested.errors as issue {
+                    emit errors: push(into: errors, value: issue)
+                }
+            } otherwise {
+                emit errors: push(into: errors, value: assembly{
+                    code: "E0307",
+                    message: "cannot find module `" + path + "`"
+                })
+            }
+        }
+    }
+    out value: assembly{ stations: stations, loaded: loaded, errors: errors }
+}
+
+-- 说明：路径的目录部分（去掉最后一段）。Windows 反斜杠也认。
+station path_dir(path) {
+    ~cut: 0 - 1
+    cycle over span(from: 0, to: len(value: path)) as k {
+        when at(items: path, index: k) is "/" { emit cut: k }
+        when at(items: path, index: k) is "\\" { emit cut: k }
+    }
+    ~acc: ""
+    when cut atleast 0 { emit acc: slice(items: path, from: 0, to: cut) }
+    out value: acc
+}
+
+-- 说明：路径本身是否绝对（`/x`、`C:`、`\\server`）。
+station path_absolute(path) {
+    ~hit: off
+    when len(value: path) atleast 1 {
+        when at(items: path, index: 0) is "/" { emit hit: on }
+        when at(items: path, index: 0) is "\\" { emit hit: on }
+    }
+    when len(value: path) atleast 2 {
+        when at(items: path, index: 1) is ":" { emit hit: on }
+    }
+    out value: hit
+}
+
+-- 说明：文本是否以某后缀结尾。
+station has_suffix(path, suffix) {
+    ~n: len(value: path)
+    ~m: len(value: suffix)
+    ~hit: off
+    when n atleast m {
+        when slice(items: path, from: n - m, to: n) is suffix { emit hit: on }
+    }
+    out value: hit
+}
+
+-- 说明：把 `use` 的路径解析成实际文件路径。
+-- 相对路径以「发起 use 的那个文件」为基准（与 Python 运行时的 ModuleLoader 一致），
+-- 没有 `.mi` 后缀时自动补上。
+station resolve_module(path, origin) {
+    ~resolved: path
+    when not path_absolute(path: path) {
+        when origin isnot nothing {
+            ~dir: path_dir(path: origin)
+            when len(value: dir) above 0 { emit resolved: dir + "/" + path }
+        }
+    }
+    ~acc: resolved
+    when not has_suffix(path: resolved, suffix: ".mi") {
+        emit acc: resolved + ".mi"
+    }
+    out value: acc
+}
+
+-- 说明：给 station 起一个带别名的名字。
+station alias_station(decl, alias) {
+    out value: assembly{
+        n: "station",
+        name: alias + "." + decl.name,
+        params: decl.params,
+        body: decl.body
+    }
+}
+
+-- 说明：运行一段源码，返回 { log, errors }。
+-- 先做静态检查（与 Python 运行时的错误码一致），有错就只报错不执行。
+station run_source(source, origin) {
+    ~tree: parse(source)
+    ~defs: load_modules(
+        items: tree.items,
+        prog: collect_defs(items: tree.items),
+        origin: origin,
+        visited: []
+    )
+    -- 静态检查要连模块里的 station 一起看，否则 use 来的函数会被误判为未知。
+    ~checked: []
+    cycle over tree.items as item { emit checked: push(into: checked, value: item) }
+    cycle over defs.loaded as item { emit checked: push(into: checked, value: item) }
+    ~errors: tree.errors
+    cycle over defs.errors as issue {
+        emit errors: push(into: errors, value: issue)
+    }
+    cycle over check_program(items: checked) as issue {
+        emit errors: push(into: errors, value: issue)
+    }
+    ~log: []
+    when len(value: errors) is 0 {
+        ~env: env_empty()
+        ~flows: []
+        cycle over tree.items as item {
+            when item.n isnot "station" and item.n isnot "use" {
+                emit flows: push(into: flows, value: item)
+            }
+        }
+        ~ran: exec_flows(flows: flows, env: env, prog: defs)
+        emit log: ran.log
+        when ran.err isnot nothing {
+            emit errors: push(into: errors, value: ran.err)
+        }
+    }
+    out value: assembly{ log: log, errors: errors }
+}

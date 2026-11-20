@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mi Browser — 米 · Signals, not statements</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">米</span>
+      <span class="brand-name">Mi Browser</span>
+      <span class="brand-tagline">Signals, not statements.</span>
+    </div>
+    <div class="controls">
+      <label class="select-label" for="example-select">examples</label>
+      <select id="example-select" aria-label="Load an example"></select>
+      <button id="run-btn" class="primary" type="button" title="Run the program (Ctrl+Enter)">Run <kbd>Ctrl+↵</kbd></button>
+      <button id="clear-btn" type="button" title="Clear the console and diagnostics">Clear</button>
+      <button id="reset-btn" type="button" title="Reset the editor to the welcome program">Reset</button>
+    </div>
+  </header>
+
+  <div class="appbar">
+    <span class="appbar-label">app</span>
+    <input id="app-url" type="url" spellcheck="false" autocomplete="off"
+           value="http://127.0.0.1:8080/app/forum.mi"
+           aria-label="URL of an MI application source">
+    <button id="app-open" type="button" title="Fetch this MI source and run it">Open app</button>
+    <span id="app-status" class="muted" aria-live="polite">run the forum backend, then Open app</span>
+  </div>
+
+  <main class="layout">
+    <section class="pane pane-editor">
+      <div class="pane-head">
+        <h2>editor</h2>
+        <span id="editor-status" class="muted">ready</span>
+      </div>
+      <div class="editor-shell">
+        <textarea id="editor" spellcheck="false" autocomplete="off" autocapitalize="off"
+                  aria-label="MI source editor"></textarea>
+      </div>
+      <div class="pane-head small">
+        <h2>diagnostics</h2>
+        <span id="diag-summary" class="muted"></span>
+      </div>
+      <div id="diagnostics" class="diagnostics" aria-live="polite"></div>
+      <div class="pane-head small">
+        <h2>spelling palette</h2>
+        <span class="muted">click a spelling to insert it at the cursor</span>
+      </div>
+      <div id="glyph-palette" class="palette"></div>
+    </section>
+
+    <section class="pane pane-side">
+      <nav class="tabs" role="tablist">
+        <button class="tab active" data-tab="console" role="tab" aria-selected="true">console</button>
+        <button class="tab" data-tab="ui" role="tab" aria-selected="false">ui</button>
+        <button class="tab" data-tab="reference" role="tab" aria-selected="false">reference</button>
+        <button class="tab" data-tab="selftest" role="tab" aria-selected="false">self-test</button>
+      </nav>
+
+      <div class="tab-panel active" id="panel-console" role="tabpanel">
+        <pre id="console-output" class="console" aria-live="polite"></pre>
+        <p class="console-hint muted">Program output from <code>show</code> appears here.</p>
+      </div>
+
+      <div class="tab-panel" id="panel-ui" role="tabpanel">
+        <div id="ui-area" class="ui-area"></div>
+        <p class="console-hint muted">Rendered by <code>ui.mount / ui.heading / ui.text / ui.button</code>.</p>
+      </div>
+
+      <div class="tab-panel" id="panel-reference" role="tabpanel">
+        <div class="reference-tools">
+          <input id="reference-filter" type="search" placeholder="filter spellings…" aria-label="Filter reference">
+          <span id="reference-count" class="muted"></span>
+        </div>
+        <div id="reference-table" class="reference"></div>
+      </div>
+
+      <div class="tab-panel" id="panel-selftest" role="tabpanel">
+        <div class="selftest-tools">
+          <button id="self-test-run" class="primary" type="button">Run all conformance cases</button>
+          <span id="self-test-summary" class="summary" aria-live="polite">not run yet</span>
+        </div>
+        <div id="self-test-results" class="selftest-results"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="js/glyphs.js"></script>
+  <script src="js/examples.js"></script>
+  <script src="js/conformance.js"></script>
+  <script src="js/lexer.js"></script>
+  <script src="js/parser.js"></script>
+  <script src="js/checker.js"></script>
+  <script src="js/evaluator.js"></script>
+  <script src="js/builtins.js"></script>
+  <script src="js/host_ports.js"></script>
+  <script src="js/ui_host.js"></script>
+  <script src="js/playground.js"></script>
+</body>
+</html>

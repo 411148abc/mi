@@ -1,0 +1,598 @@
+-- lexer.mi — 自举版 MI 词法器。
+--
+-- 把 MI 源码切成 token 列表。拼写表来自 tables.mi（由 规格/glyphs.json 生成），
+-- 因此匹配规则与 Python 运行时一致：长度降序（最长优先）、单词拼写大小写不敏感
+-- 且要求词边界、符号拼写精确匹配、字面量落到 FLAG / NIL。
+--
+-- 公开端口：
+--   lex(source) -> assembly{ tokens: [...], errors: [...] }
+--
+-- token 形状：assembly{ k: 种类, v: 值, t: 原文, ln: 行, cl: 列 }
+-- 种类：KW OP PUNCT IDENT NUMBER TEXT FLAG NIL GLYPH SEP EOF
+--
+-- 命名注意：MI 的关键字（line / out / closed …）不能当标识符，
+-- 所以内部变量统一加下划线前缀，如 _line、_out。
+
+use "tables.mi"
+
+-- 说明：单个字符是否为词字符（字母 / 数字 / 下划线）。
+station lex_word_char(ch) {
+    ~ok: off
+    when len(value: ch) is 1 {
+        when has(container: "0123456789", value: ch) { emit ok: on }
+        when has(container: "abcdefghijklmnopqrstuvwxyz", value: ch) { emit ok: on }
+        when has(container: "ABCDEFGHIJKLMNOPQRSTUVWXYZ", value: ch) { emit ok: on }
+        when ch is "_" { emit ok: on }
+        when not ok {
+            when lex_alpha_like(ch: ch) { emit ok: on }
+        }
+    }
+    out value: ok
+}
+
+-- 说明：非 ASCII 字母的近似判定：不在规格符号表里就算字母。
+-- 符号表由 工具/gen_selfhost_tables.py 从 规格/glyphs.json 生成，
+-- 因此新增运算符时不必手工维护这张表。
+station lex_alpha_like(ch) {
+    when has(container: symbol_chars(), value: ch) {
+        out value: off
+    } otherwise {
+        out value: on
+    }
+}
+
+-- 说明：是否为 ASCII 数字。
+-- 注意：不能直接写 has("0123456789", ch)——空串是任何文本的子串，
+-- 越界读到的 "" 会被误判成数字。
+station lex_digit(ch) {
+    ~hit: off
+    when len(value: ch) is 1 {
+        when has(container: "0123456789", value: ch) { emit hit: on }
+    }
+    out value: hit
+}
+
+-- 说明：取 source 第 idx 个字符（越界返回空串）。
+station lex_char_at(source, pos) {
+    ~acc: ""
+    when pos atleast 0 {
+        when pos below len(value: source) {
+            emit acc: at(items: source, index: pos)
+        }
+    }
+    out value: acc
+}
+
+-- 说明：取文本首字符（空文本返回空串）。
+station lex_first_char(text_value) {
+    when len(value: text_value) is 0 {
+        out value: ""
+    } otherwise {
+        out value: at(items: text_value, index: 0)
+    }
+}
+
+-- 说明：按首字符给拼写表建索引，避免每个 token 都扫全表。
+station lex_index() {
+    ~acc: []
+    cycle over spellings() as entry {
+        ~ch: lex_first_char(text_value: entry.s)
+        ~hit: off
+        ~next_acc: []
+        cycle over acc as slot {
+            when slot.c is ch {
+                emit hit: on
+                emit next_acc: push(into: next_acc, value: assembly{
+                    c: slot.c,
+                    e: push(into: slot.e, value: entry)
+                })
+            } otherwise {
+                emit next_acc: push(into: next_acc, value: slot)
+            }
+        }
+        when not hit {
+            emit next_acc: push(into: next_acc, value: assembly{ c: ch, e: [entry] })
+        }
+        emit acc: next_acc
+    }
+    out value: acc
+}
+
+-- 说明：取该首字符对应的候选拼写（无候选返回空列表）。
+station lex_candidates(idx, ch) {
+    ~acc: []
+    cycle over idx as slot {
+        when slot.c is ch { emit acc: slot.e }
+    }
+    out value: acc
+}
+
+-- 说明：ASCII 小写化。
+station lex_lower(text_value) {
+    ~acc: []
+    cycle over span(from: 0, to: len(value: text_value)) as k {
+        ~ch: at(items: text_value, index: k)
+        ~mapped: ch
+        cycle over span(from: 0, to: 26) as j {
+            when at(items: "ABCDEFGHIJKLMNOPQRSTUVWXYZ", index: j) is ch {
+                emit mapped: at(items: "abcdefghijklmnopqrstuvwxyz", index: j)
+            }
+        }
+        emit acc: push(into: acc, value: mapped)
+    }
+    out value: join(items: acc, with: "")
+}
+
+-- 说明：从 pos 起在候选拼写里找最长匹配；没有则返回 nothing。
+station lex_match(source, pos, candidates) {
+    ~hit: nothing
+    ~n: len(value: source)
+    cycle over candidates as entry {
+        when hit is nothing {
+            ~length: len(value: entry.s)
+            when pos + length atmost n {
+                ~window: slice(items: source, from: pos, to: pos + length)
+                when entry.w {
+                    when lex_lower(text_value: window) is lex_lower(text_value: entry.s) {
+                        ~after: ""
+                        when pos + length below n {
+                            emit after: at(items: source, index: pos + length)
+                        }
+                        ~before: ""
+                        when pos above 0 {
+                            emit before: at(items: source, index: pos - 1)
+                        }
+                        when not lex_word_char(ch: after) {
+                            when not lex_word_char(ch: before) {
+                                emit hit: entry
+                            }
+                        }
+                    }
+                } otherwise {
+                    when window is entry.s { emit hit: entry }
+                }
+            }
+        }
+    }
+    out value: hit
+}
+
+-- 说明：把行列推进到新位置（处理换行）。
+station lex_advance_pos(_line, _col, consumed) {
+    ~ln: _line
+    ~cl: _col
+    cycle over span(from: 0, to: len(value: consumed)) as k {
+        when at(items: consumed, index: k) is "\n" {
+            emit ln: ln + 1
+            emit cl: 1
+        } otherwise {
+            emit cl: cl + 1
+        }
+    }
+    out value: assembly{ ln: ln, cl: cl }
+}
+
+-- 说明：扫描文字字面量，返回 { tok | err, next, pos }。
+station lex_text(source, pos, _line, _col) {
+    ~n: len(value: source)
+    ~opener: at(items: source, index: pos)
+    ~closer: opener
+    when opener is "«" { emit closer: "»" }
+    ~i: pos + 1
+    ~chars: []
+    ~problem: ""
+    ~done: off
+    cycle while i below n {
+        when done { halt }
+        when not done {
+            ~ch: at(items: source, index: i)
+            when ch is closer {
+                emit done: on
+                emit i: i + 1
+            } otherwise when ch is "\\" {
+                when i + 1 below n {
+                    ~esc: at(items: source, index: i + 1)
+                    ~decoded: esc
+                    when esc is "n" { emit decoded: "\n" }
+                    when esc is "t" { emit decoded: "\t" }
+                    when esc is "r" { emit decoded: "\r" }
+                    when esc is "\\" { emit decoded: "\\" }
+                    when esc is "\"" { emit decoded: "\"" }
+                    when esc is "'" { emit decoded: "'" }
+                    emit chars: push(into: chars, value: decoded)
+                    emit i: i + 2
+                } otherwise {
+                    emit problem: "文字字面量以孤立的转义符结尾"
+                    emit i: i + 1
+                }
+            } otherwise {
+                emit chars: push(into: chars, value: ch)
+                emit i: i + 1
+            }
+        }
+    }
+    when not done {
+        emit problem: "未闭合的文字字面量"
+    }
+    ~raw: slice(items: source, from: pos, to: i)
+    ~moved: lex_advance_pos(_line: _line, _col: _col, consumed: raw)
+    when len(value: problem) above 0 {
+        out value: assembly{
+            err: assembly{ code: "E0002", message: problem, ln: _line, cl: _col },
+            next: i,
+            pos: moved
+        }
+    } otherwise {
+        out value: assembly{
+            tok: assembly{ k: "TEXT", v: join(items: chars, with: ""), t: raw, ln: _line, cl: _col },
+            next: i,
+            pos: moved
+        }
+    }
+}
+
+-- 说明：单个字符在给定进制下的数值（非法返回 -1）。
+station lex_radix_digit(ch) {
+    ~found: 0 - 1
+    cycle over span(from: 0, to: 16) as k {
+        when at(items: "0123456789abcdef", index: k) is ch { emit found: k }
+    }
+    out value: found
+}
+
+-- 说明：按进制解析数字文本（自举版用累乘法）。
+station lex_parse_radix(digits, radix) {
+    ~text_digits: lex_lower(text_value: digits)
+    ~acc: 0
+    ~ok: on
+    cycle over span(from: 0, to: len(value: text_digits)) as k {
+        ~digit: lex_radix_digit(ch: at(items: text_digits, index: k))
+        when digit below 0 {
+            emit ok: off
+        } otherwise when digit atleast radix {
+            emit ok: off
+        } otherwise {
+            emit acc: acc * radix + digit
+        }
+    }
+    out value: assembly{ ok: ok, value: acc }
+}
+
+-- 说明：扫描数字字面量，返回 { tok | err, next, pos }。
+station lex_number(source, pos, _line, _col) {
+    ~n: len(value: source)
+    ~i: pos
+    ~form: "int"
+    ~digits: []
+    ~problem: ""
+    ~ch0: at(items: source, index: pos)
+    ~ch1: ""
+    when pos + 1 below n { emit ch1: at(items: source, index: pos + 1) }
+
+    when ch0 is "0" and (ch1 is "x" or ch1 is "X") {
+        emit form: "hex"
+        emit i: pos + 2
+        cycle while i below n {
+            when lex_word_char(ch: at(items: source, index: i)) {
+                emit digits: push(into: digits, value: at(items: source, index: i))
+                emit i: i + 1
+            } otherwise {
+                halt
+            }
+        }
+    } otherwise when ch0 is "0" and (ch1 is "b" or ch1 is "B") {
+        emit form: "bin"
+        emit i: pos + 2
+        cycle while i below n {
+            when lex_word_char(ch: at(items: source, index: i)) {
+                emit digits: push(into: digits, value: at(items: source, index: i))
+                emit i: i + 1
+            } otherwise {
+                halt
+            }
+        }
+    } otherwise {
+        ~seen_dot: off
+        cycle while i below n {
+            ~ch: at(items: source, index: i)
+            when lex_digit(ch: ch) {
+                emit digits: push(into: digits, value: ch)
+                emit i: i + 1
+            } otherwise when ch is "_" {
+                emit i: i + 1
+            } otherwise when ch is "." and not seen_dot {
+                emit seen_dot: on
+                emit form: "real"
+                emit digits: push(into: digits, value: ch)
+                emit i: i + 1
+            } otherwise {
+                halt
+            }
+        }
+        when i below n {
+            ~ch: at(items: source, index: i)
+            when ch is "e" or ch is "E" {
+                ~probe: ["e"]
+                ~j: i + 1
+                when j below n {
+                    ~sign: at(items: source, index: j)
+                    when sign is "+" or sign is "-" {
+                        emit probe: push(into: probe, value: sign)
+                        emit j: j + 1
+                    }
+                }
+                ~expd: []
+                cycle while j below n {
+                    when lex_digit(ch: at(items: source, index: j)) {
+                        emit expd: push(into: expd, value: at(items: source, index: j))
+                        emit j: j + 1
+                    } otherwise {
+                        halt
+                    }
+                }
+                when len(value: expd) above 0 {
+                    emit form: "real"
+                    emit digits: push(into: digits, value: join(items: probe, with: ""))
+                    cycle over expd as item { emit digits: push(into: digits, value: item) }
+                    emit i: j
+                } otherwise {
+                    emit problem: "指数部分缺少数字"
+                }
+            }
+        }
+    }
+
+    ~raw: join(items: digits, with: "")
+    ~parsed: 0
+    when form is "hex" {
+        ~scan: lex_parse_radix(digits: raw, radix: 16)
+        emit parsed: scan.value
+        when not scan.ok { emit problem: "十六进制数字不合法：0x" + raw }
+    } otherwise when form is "bin" {
+        ~scan2: lex_parse_radix(digits: raw, radix: 2)
+        emit parsed: scan2.value
+        when not scan2.ok { emit problem: "二进制数字不合法：0b" + raw }
+    } otherwise {
+        emit parsed: number(raw)
+    }
+    ~consumed: slice(items: source, from: pos, to: i)
+    ~moved: lex_advance_pos(_line: _line, _col: _col, consumed: consumed)
+    when len(value: problem) above 0 {
+        out value: assembly{
+            err: assembly{ code: "E0004", message: problem, ln: _line, cl: _col },
+            next: i,
+            pos: moved
+        }
+    } otherwise {
+        out value: assembly{
+            tok: assembly{ k: "NUMBER", v: parsed, t: consumed, ln: _line, cl: _col },
+            next: i,
+            pos: moved
+        }
+    }
+}
+
+-- 说明：扫描标识符。
+station lex_ident(source, pos, _line, _col) {
+    ~n: len(value: source)
+    ~i: pos
+    ~chars: []
+    cycle while i below n {
+        ~ch: at(items: source, index: i)
+        when lex_word_char(ch: ch) {
+            emit chars: push(into: chars, value: ch)
+            emit i: i + 1
+        } otherwise {
+            halt
+        }
+    }
+    ~consumed: slice(items: source, from: pos, to: i)
+    ~moved: lex_advance_pos(_line: _line, _col: _col, consumed: consumed)
+    out value: assembly{
+        tok: assembly{ k: "IDENT", v: join(items: chars, with: ""), t: consumed, ln: _line, cl: _col },
+        next: i,
+        pos: moved
+    }
+}
+
+-- 说明：跳过行注释（调用时已确认是注释开头）。
+station lex_skip_line(source, pos) {
+    ~n: len(value: source)
+    ~i: pos
+    cycle while i below n {
+        when not (at(items: source, index: i) is "\n") {
+            emit i: i + 1
+        } otherwise {
+            halt
+        }
+    }
+    out value: i
+}
+
+-- 说明：跳过块注释（开符号 2 字符），返回 { next, ok }。
+station lex_skip_block(source, pos, opener) {
+    ~n: len(value: source)
+    ~closer: "*/"
+    when opener is "(*" { emit closer: "*)" }
+    ~i: pos + 2
+    ~done: off
+    cycle while i below n {
+        when done { halt }
+        when not done {
+            when slice(items: source, from: i, to: i + 2) is closer {
+                emit done: on
+                emit i: i + 2
+            } otherwise {
+                emit i: i + 1
+            }
+        }
+    }
+    out value: assembly{ next: i, ok: done }
+}
+
+-- 说明：查字面量定义。
+station lex_literal_of(name) {
+    ~found: assembly{ kind: "nil", value: nothing }
+    cycle over literal_kinds() as literal {
+        when literal.name is name { emit found: literal }
+    }
+    out value: found
+}
+
+-- 说明：按条目造 token；字面量条目展开成 FLAG / NIL。
+station lex_make_token(entry, text_value, _line, _col) {
+    ~k: entry.k
+    ~v: entry.v
+    when entry.k is "LITERAL" {
+        ~literal: lex_literal_of(name: entry.v)
+        when literal.kind is "flag" {
+            emit k: "FLAG"
+            emit v: literal.value
+        } otherwise {
+            emit k: "NIL"
+            emit v: nothing
+        }
+    }
+    out value: assembly{ k: k, v: v, t: text_value, ln: _line, cl: _col }
+}
+
+-- 说明：追加分隔符 token（连续分隔符合并成一个）。text 与 Python 版一致：
+-- 真实换行/分号保留原文，结尾补的那个 SEP 文本为空串。
+station lex_push_sep(tokens, kind_name, text_value, _line, _col) {
+    ~last: nothing
+    when len(value: tokens) above 0 {
+        emit last: at(items: tokens, index: len(value: tokens) - 1)
+    }
+    when last isnot nothing and last.k is "SEP" {
+        out value: tokens
+    } otherwise {
+        out value: push(into: tokens, value: assembly{ k: "SEP", v: kind_name, t: text_value, ln: _line, cl: _col })
+    }
+}
+
+-- 说明：主词法循环。返回 { tokens, errors }。
+station lex(source) {
+    ~tokens: []
+    ~errors: []
+    ~idx: lex_index()
+    ~n: len(value: source)
+    ~i: 0
+    ~_line: 1
+    ~_col: 1
+
+    cycle while i below n {
+        ~ch: at(items: source, index: i)
+        ~two: slice(items: source, from: i, to: i + 2)
+        when ch is " " or ch is "\t" or ch is "\r" {
+            emit i: i + 1
+            emit _col: _col + 1
+        } otherwise when ch is "\n" {
+            emit tokens: lex_push_sep(tokens: tokens, kind_name: "\n", text_value: "\n", _line: _line, _col: _col)
+            emit i: i + 1
+            emit _line: _line + 1
+            emit _col: 1
+        } otherwise when ch is ";" and two is ";;" {
+            ~stop_at: lex_skip_line(source: source, pos: i)
+            ~moved: lex_advance_pos(_line: _line, _col: _col, consumed: slice(items: source, from: i, to: stop_at))
+            emit i: stop_at
+            emit _line: moved.ln
+            emit _col: moved.cl
+        } otherwise when ch is ";" {
+            emit tokens: lex_push_sep(tokens: tokens, kind_name: ";", text_value: ";", _line: _line, _col: _col)
+            emit i: i + 1
+            emit _col: _col + 1
+        } otherwise when ch is "#" {
+            ~stop_at: lex_skip_line(source: source, pos: i)
+            ~moved: lex_advance_pos(_line: _line, _col: _col, consumed: slice(items: source, from: i, to: stop_at))
+            emit i: stop_at
+            emit _line: moved.ln
+            emit _col: moved.cl
+        } otherwise when two is "--" {
+            ~stop_at: lex_skip_line(source: source, pos: i)
+            ~moved: lex_advance_pos(_line: _line, _col: _col, consumed: slice(items: source, from: i, to: stop_at))
+            emit i: stop_at
+            emit _line: moved.ln
+            emit _col: moved.cl
+        } otherwise when two is "/*" or two is "(*" {
+            ~block: lex_skip_block(source: source, pos: i, opener: two)
+            when not block.ok {
+                emit errors: push(into: errors, value: assembly{
+                    code: "E0002", message: "未闭合的块注释", ln: _line, cl: _col
+                })
+            }
+            ~raw: slice(items: source, from: i, to: block.next)
+            ~moved: lex_advance_pos(_line: _line, _col: _col, consumed: raw)
+            emit i: block.next
+            emit _line: moved.ln
+            emit _col: moved.cl
+        } otherwise when ch is "\"" or ch is "'" or ch is "«" {
+            ~scanned: lex_text(source: source, pos: i, _line: _line, _col: _col)
+            when has(container: scanned, value: "err") {
+                emit errors: push(into: errors, value: scanned.err)
+            } otherwise {
+                emit tokens: push(into: tokens, value: scanned.tok)
+            }
+            emit i: scanned.next
+            emit _line: scanned.pos.ln
+            emit _col: scanned.pos.cl
+        } otherwise when lex_digit(ch: ch) or (ch is "." and lex_digit(ch: lex_char_at(source: source, pos: i + 1))) {
+            ~scanned: lex_number(source: source, pos: i, _line: _line, _col: _col)
+            when has(container: scanned, value: "err") {
+                emit errors: push(into: errors, value: scanned.err)
+            } otherwise {
+                emit tokens: push(into: tokens, value: scanned.tok)
+            }
+            emit i: scanned.next
+            emit _line: scanned.pos.ln
+            emit _col: scanned.pos.cl
+        } otherwise {
+            ~matched: lex_match(source: source, pos: i, candidates: lex_candidates(idx: idx, ch: ch))
+            when matched isnot nothing {
+                ~length: len(value: matched.s)
+                ~consumed: slice(items: source, from: i, to: i + length)
+                ~moved: lex_advance_pos(_line: _line, _col: _col, consumed: consumed)
+                emit tokens: push(into: tokens, value: lex_make_token(entry: matched, text_value: consumed, _line: _line, _col: _col))
+                emit i: i + length
+                emit _line: moved.ln
+                emit _col: moved.cl
+            } otherwise when has(container: "(){}[]⟨⟩,:.;=", value: ch) {
+                emit tokens: push(into: tokens, value: assembly{ k: "PUNCT", v: ch, t: ch, ln: _line, cl: _col })
+                emit i: i + 1
+                emit _col: _col + 1
+            } otherwise when lex_word_char(ch: ch) {
+                ~scanned: lex_ident(source: source, pos: i, _line: _line, _col: _col)
+                emit tokens: push(into: tokens, value: scanned.tok)
+                emit i: scanned.next
+                emit _line: scanned.pos.ln
+                emit _col: scanned.pos.cl
+            } otherwise {
+                emit errors: push(into: errors, value: assembly{
+                    code: "E0001", message: "无法识别的字符 " + ch, ln: _line, cl: _col
+                })
+                emit i: i + 1
+                emit _col: _col + 1
+            }
+        }
+    }
+
+    -- 与 Python 版一致：结尾补一个 SEP（若最后一个 token 已经是 SEP 则跳过）
+    ~sealed: lex_push_sep(tokens: tokens, kind_name: "\n", text_value: "", _line: _line, _col: _col)
+    ~with_eof: push(into: sealed, value: assembly{ k: "EOF", v: nothing, t: "", ln: _line, cl: _col })
+    out value: assembly{ tokens: with_eof, errors: errors }
+}
+
+-- 说明：token 种类的中文说明（诊断用）。
+station token_kind_text(tok) {
+    ~pairs: [
+        "KW", "关键字", "OP", "运算符", "PUNCT", "标点", "IDENT", "标识符",
+        "NUMBER", "数字", "TEXT", "文本", "FLAG", "开关", "NIL", "空值",
+        "GLYPH", "符号", "SEP", "分隔符", "EOF", "结尾"
+    ]
+    ~label: tok.k
+    cycle over span(from: 0, to: len(value: pairs) - 1) as k {
+        when at(items: pairs, index: k) is tok.k {
+            emit label: at(items: pairs, index: k + 1)
+        }
+    }
+    out value: label
+}

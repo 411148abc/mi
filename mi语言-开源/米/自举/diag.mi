@@ -1,0 +1,281 @@
+-- diag.mi — 自举版解释器的静态诊断。
+--
+-- Python 运行时在解析/求值过程中报错；自举版为了保持「同码同文」，在解析之后
+-- 走一趟静态检查，把能在语法树上判定的问题一次性报出来：
+--
+--   E0101 未知关键字（`wenn on { … }` 这类拼错的关键字）
+--   E0200 读未声明的 wire（`draw counter`）
+--   E0202 给只读端口赋值（`emit 参数: …`）
+--   E0203 调用不存在的 station/内置函数
+--   E0204 未知实参标签
+--   E0205 缺少必填实参
+--   E0301 除以零（字面量零）
+--   E0303 调用不可调用的值
+--   E0304 在 cycle 之外用 skip
+--
+-- 返回 { code, message } 列表，顺序与源文件出现顺序一致。
+
+use "values.mi"
+use "builtins.mi"
+
+-- 说明：空诊断集合。
+station diag_none() {
+    out value: []
+}
+
+-- 说明：造一条诊断。
+station diag_make(code, message) {
+    out value: assembly{ code: code, message: message }
+}
+
+-- 说明：收集 program 里的 station 名。
+station station_names(items) {
+    ~acc: []
+    cycle over items as item {
+        when item.n is "station" {
+            emit acc: push(into: acc, value: item.name)
+        }
+    }
+    out value: acc
+}
+
+-- 说明：按名字取 station 定义。
+station station_of(items, name) {
+    ~found: nothing
+    cycle over items as item {
+        when item.n is "station" and item.name is name {
+            emit found: item
+        }
+    }
+    out value: found
+}
+
+-- 说明：检查整个程序。
+station check_program(items) {
+    ~found: []
+    ~stations: station_names(items: items)
+    ~wires: []
+    cycle over items as item {
+        when item.n is "wire" {
+            emit wires: push(into: wires, value: item.name)
+        }
+        emit found: log_concat(a: found, b: check_item(item: item, items: items, stations: stations, wires: wires, params: [], in_cycle: off))
+    }
+    out value: found
+}
+
+-- 说明：检查一个顶层条目。
+station check_item(item, items, stations, wires, params, in_cycle) {
+    ~found: []
+    when item.n is "wire" {
+        when item.init isnot nothing {
+            emit found: log_concat(a: found, b: check_expr(nd: item.init, items: items, stations: stations, wires: wires, params: params, reads: on))
+        }
+    } otherwise when item.n is "station" {
+        ~inner: []
+        cycle over item.params as param {
+            emit inner: push(into: inner, value: param.name)
+        }
+        -- station 没有闭包：函数体看不到顶层 wire，只能通过端口拿数据。
+        emit found: log_concat(a: found, b: check_flows(flows: item.body, items: items, stations: stations, wires: [], params: inner, in_cycle: off))
+    } otherwise {
+        emit found: log_concat(a: found, b: check_flow(flow: item, items: items, stations: stations, wires: wires, params: params, in_cycle: in_cycle))
+    }
+    out value: found
+}
+
+-- 说明：检查一组语句。`wire` 声明按源码顺序进入作用域，后面的语句才能读到它。
+station check_flows(flows, items, stations, wires, params, in_cycle) {
+    ~found: []
+    ~scope: wires
+    cycle over flows as flow {
+        emit found: log_concat(a: found, b: check_flow(flow: flow, items: items, stations: stations, wires: scope, params: params, in_cycle: in_cycle))
+        when flow.n is "wire" {
+            emit scope: push(into: scope, value: flow.name)
+        }
+    }
+    out value: found
+}
+
+-- 说明：检查一条语句。
+station check_flow(flow, items, stations, wires, params, in_cycle) {
+    ~tag: flow.n
+    ~found: []
+    when tag is "badkw" {
+        emit found: push(into: found, value: diag_make(code: "E0101", message: "unknown keyword `" + flow.name + "`"))
+    } otherwise when tag is "emit" {
+        when has(container: params, value: flow.target) {
+            emit found: push(into: found, value: diag_make(code: "E0202", message: "`" + flow.target + "` is a read-only port"))
+        }
+        when not has(container: wires, value: flow.target) {
+            when not has(container: params, value: flow.target) {
+                emit found: push(into: found, value: diag_make(code: "E0200", message: "wire `" + flow.target + "` is used before it is declared"))
+            }
+        }
+        emit found: log_concat(a: found, b: check_expr(nd: flow.value, items: items, stations: stations, wires: wires, params: params, reads: on))
+    } otherwise when tag is "out" {
+        emit found: log_concat(a: found, b: check_expr(nd: flow.value, items: items, stations: stations, wires: wires, params: params, reads: on))
+    } otherwise when tag is "flow" {
+        emit found: log_concat(a: found, b: check_expr(nd: flow.expr, items: items, stations: stations, wires: wires, params: params, reads: on))
+    } otherwise when tag is "return" {
+        emit found: log_concat(a: found, b: check_expr(nd: flow.value, items: items, stations: stations, wires: wires, params: params, reads: on))
+    } otherwise when tag is "skip" {
+        when not in_cycle {
+            emit found: push(into: found, value: diag_make(code: "E0304", message: "`skip` can only be used inside a cycle"))
+        }
+    } otherwise when tag is "when" {
+        emit found: log_concat(a: found, b: check_expr(nd: flow.cond, items: items, stations: stations, wires: wires, params: params, reads: on))
+        emit found: log_concat(a: found, b: check_flows(flows: flow.body, items: items, stations: stations, wires: wires, params: params, in_cycle: in_cycle))
+        when flow.other isnot nothing {
+            when flow.other.n is "block" {
+                emit found: log_concat(a: found, b: check_flows(flows: flow.other.body, items: items, stations: stations, wires: wires, params: params, in_cycle: in_cycle))
+            } otherwise {
+                emit found: log_concat(a: found, b: check_flow(flow: flow.other, items: items, stations: stations, wires: wires, params: params, in_cycle: in_cycle))
+            }
+        }
+    } otherwise when tag is "cycle" {
+        when flow.head isnot nothing {
+            emit found: log_concat(a: found, b: check_expr(nd: flow.head, items: items, stations: stations, wires: wires, params: params, reads: on))
+        }
+        -- `cycle … as i` 把 i 绑成循环内的局部变量。
+        ~inner: params
+        when flow.var isnot nothing {
+            emit inner: push(into: params, value: flow.var)
+        }
+        emit found: log_concat(a: found, b: check_flows(flows: flow.body, items: items, stations: stations, wires: wires, params: inner, in_cycle: on))
+    } otherwise when tag is "for" {
+        emit found: log_concat(a: found, b: check_expr(nd: flow.items, items: items, stations: stations, wires: wires, params: params, reads: on))
+        ~inner: push(into: params, value: flow.var)
+        emit found: log_concat(a: found, b: check_flows(flows: flow.body, items: items, stations: stations, wires: wires, params: inner, in_cycle: on))
+    }
+    out value: found
+}
+
+-- 说明：检查一个表达式（reads 为 on 时 `draw` 要校验 wire 已声明）。
+station check_expr(nd, items, stations, wires, params, reads) {
+    ~found: []
+    ~tag: nd.n
+    when tag is "name" {
+        -- 表达式里出现的裸名字必须是：局部变量/参数、wire、station 或内置函数。
+        ~known: off
+        when has(container: wires, value: nd.name) { emit known: on }
+        when has(container: params, value: nd.name) { emit known: on }
+        when builtin_exists(name: nd.name) { emit known: on }
+        when station_of(items: items, name: nd.name) isnot nothing { emit known: on }
+        when not known {
+            emit found: push(into: found, value: diag_make(code: "E0203", message: "unknown name `" + nd.name + "`"))
+        }
+    } otherwise when tag is "read" {
+        when not has(container: wires, value: nd.name) {
+            when not has(container: params, value: nd.name) {
+                emit found: push(into: found, value: diag_make(code: "E0200", message: "wire `" + nd.name + "` is used before it is declared"))
+            }
+        }
+    } otherwise when tag is "bin" {
+        emit found: log_concat(a: found, b: check_expr(nd: nd.lhs, items: items, stations: stations, wires: wires, params: params, reads: reads))
+        -- `and` / `or` 短路：右侧可能永远不执行，所以不在这里判除以零。
+        when nd.op isnot "AND" and nd.op isnot "OR" {
+            emit found: log_concat(a: found, b: check_expr(nd: nd.rhs, items: items, stations: stations, wires: wires, params: params, reads: reads))
+            when nd.op is "DIV" or nd.op is "IDIV" or nd.op is "MOD" {
+                when nd.rhs.n is "num" and nd.rhs.value is 0 {
+                    emit found: push(into: found, value: diag_make(code: "E0301", message: "cannot divide by zero"))
+                }
+            }
+        }
+    } otherwise when tag is "un" {
+        emit found: log_concat(a: found, b: check_expr(nd: nd.operand, items: items, stations: stations, wires: wires, params: params, reads: reads))
+    } otherwise when tag is "list" {
+        cycle over nd.items as child {
+            emit found: log_concat(a: found, b: check_expr(nd: child, items: items, stations: stations, wires: wires, params: params, reads: reads))
+        }
+    } otherwise when tag is "asm" {
+        cycle over nd.fields as field {
+            emit found: log_concat(a: found, b: check_expr(nd: field.value, items: items, stations: stations, wires: wires, params: params, reads: reads))
+        }
+    } otherwise when tag is "field" {
+        emit found: log_concat(a: found, b: check_expr(nd: nd.base, items: items, stations: stations, wires: wires, params: params, reads: reads))
+    } otherwise when tag is "call" {
+        emit found: log_concat(a: found, b: check_call(nd: nd, items: items, stations: stations, wires: wires, params: params, reads: reads))
+    }
+    out value: found
+}
+
+-- 说明：检查一个调用：实参、目标必需存在或可调用、标签与必填参数。
+station check_call(nd, items, stations, wires, params, reads) {
+    ~found: []
+    cycle over nd.args as arg {
+        emit found: log_concat(a: found, b: check_expr(nd: arg.value, items: items, stations: stations, wires: wires, params: params, reads: reads))
+    }
+    when nd.callee isnot nothing {
+        emit found: log_concat(a: found, b: check_expr(nd: nd.callee, items: items, stations: stations, wires: wires, params: params, reads: reads))
+        ~callee_kind: nd.callee.n
+        when callee_kind is "num" or callee_kind is "text" or callee_kind is "flag" or callee_kind is "nil" {
+            emit found: push(into: found, value: diag_make(code: "E0303", message: "this value cannot be called"))
+        }
+    } otherwise {
+        ~name: nd.name
+        ~dotted: has(container: name, value: ".")
+        ~is_value: has(container: wires, value: name)
+        when has(container: params, value: name) { emit is_value: on }
+        when not builtin_exists(name: name) and not dotted and not is_value {
+            ~decl: station_of(items: items, name: name)
+            when decl is nothing {
+                emit found: push(into: found, value: diag_make(code: "E0203", message: "unknown station or builtin `" + name + "`"))
+            } otherwise {
+                emit found: log_concat(a: found, b: check_arguments(nd: nd, decl: decl))
+            }
+        } otherwise when dotted {
+            ~decl: station_of(items: items, name: name)
+            when decl isnot nothing {
+                emit found: log_concat(a: found, b: check_arguments(nd: nd, decl: decl))
+            }
+        }
+    }
+    out value: found
+}
+
+-- 说明：检查实参的标签与必填项。
+station check_arguments(nd, decl) {
+    ~found: []
+    ~known: []
+    ~required: []
+    cycle over decl.params as param {
+        emit known: push(into: known, value: param.name)
+        when param.def is nothing {
+            emit required: push(into: required, value: param.name)
+        }
+    }
+    ~given: []
+    cycle over nd.args as arg {
+        when arg.label isnot nothing {
+            when not has(container: known, value: arg.label) {
+                emit found: push(into: found, value: diag_make(code: "E0204", message: "unknown argument label `" + arg.label + "`"))
+            }
+            when not has(container: given, value: arg.label) {
+                emit given: push(into: given, value: arg.label)
+            }
+        } otherwise {
+            emit given: push(into: given, value: "")
+        }
+    }
+    ~positional: 0
+    cycle over nd.args as arg {
+        when arg.label is nothing { emit positional: positional + 1 }
+    }
+    ~missing: []
+    ~index: 0
+    cycle over required as want {
+        ~covered: off
+        cycle over nd.args as arg {
+            when arg.label isnot nothing and arg.label is want { emit covered: on }
+        }
+        when not covered and index atleast positional {
+            emit missing: push(into: missing, value: want)
+        }
+        emit index: index + 1
+    }
+    cycle over missing as want {
+        emit found: push(into: found, value: diag_make(code: "E0205", message: "missing argument `" + want + "`"))
+    }
+    out value: found
+}

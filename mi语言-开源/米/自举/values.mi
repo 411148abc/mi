@@ -1,0 +1,410 @@
+-- values.mi — 自举版解释器的值模型、显示与运算符。
+--
+-- MI 没有可变状态，只有 wire。解释器需要「按运行时名字取字段」（环境、端口、
+-- 用户装配体都是这样），而 MI 不支持这种动态取字段，所以内部统一用
+--
+--   装配体 = assembly{ tag: "asm", pairs: [[名字, 值] …] }
+--
+-- 只有交给宿主内置函数时（json 编码等）才临时还原成真装配体（to_host）。
+--
+-- 公开端口：
+--   asm_make / asm_get / asm_has / asm_keys / asm_set / is_asm
+--   kind_of / to_host / display_of / display_nested / quote_text / number_text
+--   truthy / equal_of / apply_bin / apply_un / log_concat / list_concat
+
+-- ============================================================ 值模型与工具
+
+-- 说明：装配体值（解释器内部表示）。
+station asm_new() {
+    out value: assembly{ tag: "asm", pairs: [] }
+}
+
+-- 说明：造一个带字段的装配体值。
+station asm_make(pairs) {
+    out value: assembly{ tag: "asm", pairs: pairs }
+}
+
+-- 说明：该值是否为（解释器内部的）装配体。
+station is_asm(value) {
+    ~hit: off
+    when kind(value: value) is "assembly" {
+        when has(container: value, value: "tag") {
+            when value.tag is "asm" { emit hit: on }
+        }
+    }
+    out value: hit
+}
+
+-- 说明：该值是否为调用点携带的内置函数包装。
+station is_builtin(value) {
+    ~hit: off
+    when kind(value: value) is "assembly" {
+        when has(container: value, value: "builtin") { emit hit: on }
+    }
+    out value: hit
+}
+
+-- 说明：装配体取字段（找不到返回 nothing）。
+station asm_get(asm, name) {
+    ~acc: nothing
+    cycle over asm.pairs as pair {
+        when at(items: pair, index: 0) is name {
+            emit acc: at(items: pair, index: 1)
+        }
+    }
+    out value: acc
+}
+
+-- 说明：装配体是否含某字段。
+station asm_has(asm, name) {
+    ~hit: off
+    cycle over asm.pairs as pair {
+        when at(items: pair, index: 0) is name { emit hit: on }
+    }
+    out value: hit
+}
+
+-- 说明：装配体字段名列表（源码顺序）。
+station asm_keys(asm) {
+    ~acc: []
+    cycle over asm.pairs as pair {
+        emit acc: push(into: acc, value: at(items: pair, index: 0))
+    }
+    out value: acc
+}
+
+-- 说明：装配体写入字段（同名替换，否则追加）。
+station asm_set(asm, name, value) {
+    ~hit: off
+    ~acc: []
+    cycle over asm.pairs as pair {
+        when at(items: pair, index: 0) is name {
+            emit hit: on
+            emit acc: push(into: acc, value: [name, value])
+        } otherwise {
+            emit acc: push(into: acc, value: pair)
+        }
+    }
+    when not hit {
+        emit acc: push(into: acc, value: [name, value])
+    }
+    out value: asm_make(pairs: acc)
+}
+
+-- 说明：装配体合并（第二个的字段覆盖第一个）。
+station asm_merge(a, b) {
+    ~acc: a
+    cycle over b.pairs as pair {
+        emit acc: asm_set(asm: acc, name: at(items: pair, index: 0), value: at(items: pair, index: 1))
+    }
+    out value: acc
+}
+
+-- 说明：值的种类名（与 Python 运行时的 kind() 一致）。
+-- 可调用值（station / 内置）在内部也是装配体，所以先按标记字段判断。
+station kind_of(value) {
+    ~name: kind(value: value)
+    when is_asm(value: value) {
+        emit name: "assembly"
+        when asm_has(asm: value, name: "kind") {
+            ~label: asm_get(asm: value, name: "kind")
+            when label is "station" { emit name: "station" }
+            when label is "builtin" { emit name: "builtin" }
+        }
+    }
+    out value: name
+}
+
+-- 说明：把解释器内部值还原成真装配体（交给宿主内置函数时用）。
+station to_host(value) {
+    ~acc: nothing
+    when is_asm(value: value) {
+        ~real: assembly{}
+        cycle over value.pairs as pair {
+            emit real: place(target: real, field: at(items: pair, index: 0), value: to_host(value: at(items: pair, index: 1)))
+        }
+        emit acc: real
+    } otherwise when kind(value: value) is "list" {
+        ~items: []
+        cycle over value as item {
+            emit items: push(into: items, value: to_host(value: item))
+        }
+        emit acc: items
+    } otherwise {
+        emit acc: value
+    }
+    out value: acc
+}
+
+-- 说明：显示一个值（对应 Python 运行时的 display()）。
+station display_of(value) {
+    ~text_value: ""
+    ~kind: kind_of(value: value)
+    when kind is "nothing" {
+        emit text_value: "nothing"
+    } otherwise when kind is "flag" {
+        emit text_value: "off"
+        when value { emit text_value: "on" }
+    } otherwise when kind is "number" {
+        emit text_value: number_text(value: value)
+    } otherwise when kind is "text" {
+        emit text_value: value
+    } otherwise when kind is "list" {
+        ~parts: []
+        cycle over value as item {
+            emit parts: push(into: parts, value: display_nested(value: item))
+        }
+        emit text_value: "[" + join(items: parts, with: ", ") + "]"
+    } otherwise when kind is "station" {
+        emit text_value: "station:" + asm_get(asm: value, name: "name")
+    } otherwise when kind is "builtin" {
+        emit text_value: "builtin:" + asm_get(asm: value, name: "name")
+    } otherwise when kind is "assembly" {
+        ~parts: []
+        cycle over value.pairs as pair {
+            emit parts: push(into: parts, value: at(items: pair, index: 0) + ": " + display_nested(value: at(items: pair, index: 1)))
+        }
+        emit text_value: "assembly{" + join(items: parts, with: ", ") + "}"
+    } otherwise {
+        emit text_value: "nothing"
+    }
+    out value: text_value
+}
+
+-- 说明：嵌套显示：文本加引号，列表递归，其余与顶层一致。
+station display_nested(value) {
+    ~kind: kind_of(value: value)
+    ~acc: display_of(value: value)
+    when kind is "text" {
+        emit acc: quote_text(text_value: value)
+    } otherwise when kind is "list" {
+        ~parts: []
+        cycle over value as item {
+            emit parts: push(into: parts, value: display_nested(value: item))
+        }
+        emit acc: "[" + join(items: parts, with: ", ") + "]"
+    }
+    out value: acc
+}
+
+-- 说明：文本加引号并转义（对应 Python 的 _quote）。
+station quote_text(text_value) {
+    ~acc: ["\""]
+    cycle over span(from: 0, to: len(value: text_value)) as k {
+        ~ch: at(items: text_value, index: k)
+        ~mapped: ch
+        when ch is "\"" { emit mapped: "\\\"" }
+        when ch is "\\" { emit mapped: "\\\\" }
+        when ch is "\n" { emit mapped: "\\n" }
+        when ch is "\t" { emit mapped: "\\t" }
+        when ch is "\r" { emit mapped: "\\r" }
+        emit acc: push(into: acc, value: mapped)
+    }
+    out value: join(items: push(into: acc, value: "\""), with: "")
+}
+
+-- 说明：数字显示（整数不带小数点，实数保留原样）。
+station number_text(value) {
+    ~raw: text(value: value)
+    ~trimmed: raw
+    when has(container: raw, value: ".0") {
+        ~head: slice(items: raw, from: 0, to: len(value: raw) - 2)
+        when number(head) is value { emit trimmed: head }
+    }
+    out value: trimmed
+}
+
+-- 说明：真值判断（与 Python 运行时的 truthy 一致）。
+station truthy(value) {
+    ~hit: off
+    ~kind: kind_of(value: value)
+    when kind is "nothing" {
+        emit hit: off
+    } otherwise when kind is "flag" {
+        emit hit: value
+    } otherwise when kind is "number" {
+        when value isnot 0 { emit hit: on }
+    } otherwise when kind is "text" {
+        when len(value: value) above 0 { emit hit: on }
+    } otherwise when kind is "list" {
+        when len(value: value) above 0 { emit hit: on }
+    } otherwise when kind is "assembly" {
+        when len(value: value.pairs) above 0 { emit hit: on }
+    }
+    out value: hit
+}
+
+-- 说明：结构相等（装配体要比内部 pairs，所以不能只靠 is）。
+station equal_of(left, right) {
+    ~kind: kind_of(value: left)
+    ~same: off
+    when kind isnot kind_of(value: right) {
+        when kind is "number" and kind_of(value: right) is "number" {
+            when left is right { emit same: on }
+        }
+    } otherwise when kind is "assembly" {
+        emit same: pairs_equal(a: left.pairs, b: right.pairs)
+    } otherwise when kind is "list" {
+        emit same: pairs_equal(a: left, b: right)
+    } otherwise {
+        when left is right { emit same: on }
+    }
+    out value: same
+}
+
+-- 说明：逐项比较两个列表。
+station pairs_equal(a, b) {
+    ~same: on
+    when len(value: a) isnot len(value: b) {
+        emit same: off
+    } otherwise {
+        cycle over span(from: 0, to: len(value: a)) as k {
+            ~lhs: at(items: a, index: k)
+            ~rhs: at(items: b, index: k)
+            when is_pair(value: lhs) {
+                when not equal_of(left: lhs, right: rhs) { emit same: off }
+            } otherwise {
+                when not equal_of(left: lhs, right: rhs) { emit same: off }
+            }
+        }
+    }
+    out value: same
+}
+
+-- 说明：该值是否为内部 [名, 值] 对（只用于 pairs_equal 的可读性）。
+station is_pair(value) {
+    out value: kind(value: value) is "list"
+}
+
+-- ================================================================ 运算符
+
+-- 说明：二元运算（含 MI 的运算符重载：文本/列表拼接、列表重复、装配体合并）。
+station apply_bin(op, left, right) {
+    ~value: nothing
+    when op is "PLUS" {
+        emit value: plus_of(left: left, right: right)
+    } otherwise when op is "MINUS" {
+        emit value: left - right
+    } otherwise when op is "TIMES" {
+        emit value: times_of(left: left, right: right)
+    } otherwise when op is "DIV" {
+        emit value: left / right
+    } otherwise when op is "IDIV" {
+        emit value: left // right
+    } otherwise when op is "MOD" {
+        emit value: left % right
+    } otherwise when op is "POW" {
+        emit value: left ** right
+    } otherwise when op is "EQ" {
+        emit value: equal_of(left: left, right: right)
+    } otherwise when op is "NE" {
+        emit value: not equal_of(left: left, right: right)
+    } otherwise when op is "LT" {
+        emit value: compare_of(op: op, left: left, right: right)
+    } otherwise when op is "LE" {
+        emit value: compare_of(op: op, left: left, right: right)
+    } otherwise when op is "GT" {
+        emit value: compare_of(op: op, left: left, right: right)
+    } otherwise when op is "GE" {
+        emit value: compare_of(op: op, left: left, right: right)
+    } otherwise when op is "AND" {
+        emit value: apply_logic(op: "AND", left: left, right: right)
+    } otherwise when op is "OR" {
+        emit value: apply_logic(op: "OR", left: left, right: right)
+    }
+    out value: value
+}
+
+-- 说明：`+`：数字相加、文本拼接、列表连接、装配体合并。
+station plus_of(left, right) {
+    ~lshape: kind_of(value: left)
+    ~rshape: kind_of(value: right)
+    ~value: left + right
+    when lshape is "text" and rshape is "text" {
+        emit value: left + right
+    } otherwise when lshape is "list" and rshape is "list" {
+        emit value: list_concat(a: left, b: right)
+    } otherwise when lshape is "assembly" and rshape is "assembly" {
+        emit value: asm_merge(a: left, b: right)
+    }
+    out value: value
+}
+
+-- 说明：`*`：数字相乘、文本/列表重复。
+station times_of(left, right) {
+    ~lshape: kind_of(value: left)
+    ~value: left * right
+    when lshape is "text" or lshape is "list" {
+        ~rounds: right
+        ~acc: left
+        when lshape is "text" { emit acc: "" }
+        when lshape is "list" { emit acc: [] }
+        ~k: 0
+        cycle while k below rounds {
+            when lshape is "text" { emit acc: acc + left }
+            when lshape is "list" { emit acc: list_concat(a: acc, b: left) }
+            emit k: k + 1
+        }
+        emit value: acc
+    }
+    out value: value
+}
+
+-- 说明：比较运算（数字与文本），其余类型组合交给宿主运算符报错。
+station compare_of(op, left, right) {
+    ~hit: off
+    when op is "LT" {
+        when left below right { emit hit: on }
+    } otherwise when op is "LE" {
+        when left atmost right { emit hit: on }
+    } otherwise when op is "GT" {
+        when left above right { emit hit: on }
+    } otherwise when op is "GE" {
+        when left atleast right { emit hit: on }
+    }
+    out value: hit
+}
+
+-- 说明：逻辑与 / 或（短路在 eval_bin 里处理，这里只处理值）。
+station apply_logic(op, left, right) {
+    ~value: right
+    when op is "AND" {
+        when not truthy(value: left) { emit value: left }
+    } otherwise when op is "OR" {
+        when truthy(value: left) { emit value: left }
+    }
+    out value: value
+}
+
+-- 说明：一元运算。
+station apply_un(op, operand) {
+    ~value: nothing
+    when op is "MINUS" {
+        emit value: 0 - operand
+    } otherwise when op is "NOT" {
+        ~hit: on
+        when truthy(value: operand) { emit hit: off }
+        emit value: hit
+    }
+    out value: value
+}
+
+
+-- 说明：拼接两段输出行。
+station log_concat(a, b) {
+    ~acc: a
+    cycle over b as row { emit acc: push(into: acc, value: row) }
+    out value: acc
+}
+
+-- 说明：拼接两个列表。
+station list_concat(a, b) {
+    ~acc: a
+    cycle over b as item { emit acc: push(into: acc, value: item) }
+    out value: acc
+}
+
+-- 说明：把内部 [名, 值] 对列表变成内部装配体。
+station asm_from_pairs(pairs) {
+    out value: asm_make(pairs: pairs)
+}

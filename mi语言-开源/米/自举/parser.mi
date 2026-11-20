@@ -1,0 +1,670 @@
+-- parser.mi — 自举版 MI 语法分析器。
+--
+-- 输入是 lexer.mi 产出的 token 列表，输出是一棵用装配体表示的语法树。
+-- 所有 station 都是纯函数：当前位置通过返回值往下传，形状统一为
+--   { node: 语法节点, pos: 下一个位置 }
+--
+-- 命名约定：MI 的关键字与字面量都是保留字（node / next / yes / line / out /
+-- closed / kind / map / index / stop / end …），所以局部变量一律加下划线前缀，
+-- 装配体字段用 n / value / items / lhs / rhs 这类安全名字。
+--
+-- 语法节点（n 为种类）：
+--   条目  { n: "station", name, params, body }
+--         { n: "wire", name, init }   { n: "use", path, alias }
+--   语句  { n: "emit", target, value }   { n: "when", cond, body, other }
+--         { n: "cycle", ckind, head, var, body }   { n: "for", var, items, body }
+--         { n: "out", name, value }   { n: "return", value }
+--         { n: "halt" }   { n: "skip" }   { n: "flow", expr }
+--   表达式 { n: "num", value } { n: "text", value } { n: "flag", value } { n: "nil" }
+--          { n: "list", items } { n: "asm", fields }
+--          { n: "name", name, glyph } { n: "field", base, name }
+--          { n: "call", name, args, callee } { n: "bin", op, lhs, rhs }
+--          { n: "un", op, operand } { n: "read", name }
+--   实参  { label, value }   字段  { name, value }
+
+use "tables.mi"
+use "lexer.mi"
+
+-- 说明：取第 pos 个 token；越界时钳到两端，避免到处判空。
+station tk(tokens, _pos) {
+    ~idx: _pos
+    when idx below 0 { emit idx: 0 }
+    when idx atleast len(value: tokens) { emit idx: len(value: tokens) - 1 }
+    out value: at(items: tokens, index: idx)
+}
+
+-- 说明：第 pos 个 token 是否为标点 punct。
+station at_punct(tokens, _pos, punct) {
+    ~tok: tk(tokens: tokens, _pos: _pos)
+    out value: tok.k is "PUNCT" and tok.v is punct
+}
+
+-- 说明：第 pos 个 token 是否为关键字之一。
+station at_kw(tokens, _pos, names) {
+    ~tok: tk(tokens: tokens, _pos: _pos)
+    ~hit: off
+    when tok.k is "KW" {
+        cycle over names as item {
+            when item is tok.v { emit hit: on }
+        }
+    }
+    out value: hit
+}
+
+-- 说明：是否到了分隔符或结尾。
+station at_sep(tokens, _pos) {
+    ~tok: tk(tokens: tokens, _pos: _pos)
+    out value: tok.k is "SEP" or tok.k is "EOF"
+}
+
+-- 说明：跳过连续分隔符，返回新位置。
+station skip_seps(tokens, _pos) {
+    ~idx: _pos
+    cycle while at_sep(tokens: tokens, _pos: idx) {
+        ~tok: tk(tokens: tokens, _pos: idx)
+        when tok.k is "EOF" { halt }
+        emit idx: idx + 1
+    }
+    out value: idx
+}
+
+-- 说明：按 OP 名查运算符表。
+station op_info(name) {
+    ~found: nothing
+    cycle over operators() as op {
+        when op.name is name { emit found: op }
+    }
+    out value: found
+}
+
+-- 说明：解析整个程序。
+station parse_program(tokens) {
+    ~items: []
+    ~idx: 0
+    ~errors: []
+    cycle while tk(tokens: tokens, _pos: idx).k isnot "EOF" {
+        emit idx: skip_seps(tokens: tokens, _pos: idx)
+        when tk(tokens: tokens, _pos: idx).k is "EOF" { halt }
+        ~item: parse_item(tokens: tokens, _pos: idx)
+        when item.node isnot nothing {
+            emit items: push(into: items, value: item.node)
+        }
+        when item.pos atmost idx { halt }
+        emit idx: item.pos
+        when idx atleast len(value: tokens) { halt }
+    }
+    out value: assembly{ items: items, errors: errors }
+}
+
+-- 说明：解析一个顶层条目。
+station parse_item(tokens, _pos) {
+    ~tok: tk(tokens: tokens, _pos: _pos)
+    when tok.k is "KW" and tok.v is "STATION" {
+        out value: parse_station(tokens: tokens, _pos: _pos)
+    } otherwise when tok.k is "KW" and tok.v is "WIRE" {
+        out value: parse_wire(tokens: tokens, _pos: _pos)
+    } otherwise when tok.k is "KW" and tok.v is "USE" {
+        out value: parse_use(tokens: tokens, _pos: _pos)
+    } otherwise {
+        out value: parse_flow(tokens: tokens, _pos: _pos)
+    }
+}
+
+-- 说明：wire 名称 [: 初值]。
+station parse_wire(tokens, _pos) {
+    ~name_tok: tk(tokens: tokens, _pos: _pos + 1)
+    ~idx: _pos + 2
+    ~init: nothing
+    when at_punct(tokens: tokens, _pos: idx, punct: ":") or at_punct(tokens: tokens, _pos: idx, punct: "=") {
+        ~parsed: parse_expr(tokens: tokens, _pos: idx + 1, min_prec: 0)
+        emit init: parsed.node
+        emit idx: parsed.pos
+    }
+    out value: assembly{
+        node: assembly{ n: "wire", name: name_tok.v, init: init },
+        pos: idx
+    }
+}
+
+-- 说明：use "路径" [as 别名]。
+station parse_use(tokens, _pos) {
+    ~path_tok: tk(tokens: tokens, _pos: _pos + 1)
+    ~idx: _pos + 2
+    ~alias: nothing
+    when at_kw(tokens: tokens, _pos: idx, names: ["AS"]) {
+        ~alias_tok: tk(tokens: tokens, _pos: idx + 1)
+        emit alias: alias_tok.v
+        emit idx: idx + 2
+    }
+    out value: assembly{
+        node: assembly{ n: "use", path: path_tok.v, alias: alias },
+        pos: idx
+    }
+}
+
+-- 说明：station 名称 (参数) 块。
+station parse_station(tokens, _pos) {
+    ~name_tok: tk(tokens: tokens, _pos: _pos + 1)
+    ~idx: _pos + 2
+    ~params: []
+    when at_punct(tokens: tokens, _pos: idx, punct: "(") {
+        ~scan: parse_params(tokens: tokens, _pos: idx + 1)
+        emit params: scan.params
+        emit idx: scan.pos
+    }
+    ~body: parse_block(tokens: tokens, _pos: idx)
+    out value: assembly{
+        node: assembly{ n: "station", name: name_tok.v, params: params, body: body.node },
+        pos: body.pos
+    }
+}
+
+-- 说明：参数表：名称 [: 默认值]。
+station parse_params(tokens, _pos) {
+    ~params: []
+    ~idx: _pos
+    cycle while not at_punct(tokens: tokens, _pos: idx, punct: ")") {
+        ~tok: tk(tokens: tokens, _pos: idx)
+        when tok.k is "EOF" { halt }
+        when tok.k is "SEP" {
+            emit idx: idx + 1
+        } otherwise when tok.k is "PUNCT" and tok.v is "," {
+            emit idx: idx + 1
+        } otherwise {
+            ~default: nothing
+            ~after: idx + 1
+            when at_punct(tokens: tokens, _pos: after, punct: ":") or at_punct(tokens: tokens, _pos: after, punct: "=") {
+                ~parsed: parse_expr(tokens: tokens, _pos: after + 1, min_prec: 0)
+                emit default: parsed.node
+                emit after: parsed.pos
+            }
+            emit params: push(into: params, value: assembly{ name: tok.v, def: default })
+            emit idx: after
+        }
+        when idx atleast len(value: tokens) { halt }
+    }
+    out value: assembly{ params: params, pos: idx + 1 }
+}
+
+-- 说明：块：{ … } 或 do/begin … end，返回 { node: [flow…], pos }。
+station parse_block(tokens, _pos) {
+    ~idx: _pos
+    ~braced: off
+    ~keyword_closed: off
+    when at_punct(tokens: tokens, _pos: idx, punct: "{") {
+        emit braced: on
+        emit idx: idx + 1
+    } otherwise when at_kw(tokens: tokens, _pos: idx, names: ["DO", "BEGIN"]) {
+        emit keyword_closed: on
+        emit idx: idx + 1
+    }
+    ~flows: []
+    cycle while not block_done(tokens: tokens, _pos: idx, braced: braced, keyword_closed: keyword_closed) {
+        emit idx: skip_seps(tokens: tokens, _pos: idx)
+        when block_done(tokens: tokens, _pos: idx, braced: braced, keyword_closed: keyword_closed) { halt }
+        ~parsed: parse_flow(tokens: tokens, _pos: idx)
+        when parsed.node isnot nothing {
+            emit flows: push(into: flows, value: parsed.node)
+        }
+        when parsed.pos atmost idx { halt }
+        emit idx: parsed.pos
+        when idx atleast len(value: tokens) { halt }
+    }
+    out value: assembly{ node: flows, pos: idx + 1 }
+}
+
+-- 说明：块是否结束。
+station block_done(tokens, _pos, braced, keyword_closed) {
+    ~tok: tk(tokens: tokens, _pos: _pos)
+    ~done: off
+    when tok.k is "EOF" { emit done: on }
+    when braced {
+        when tok.k is "PUNCT" and tok.v is "}" { emit done: on }
+    } otherwise when keyword_closed {
+        when tok.k is "KW" and tok.v is "END" { emit done: on }
+    }
+    out value: done
+}
+
+-- 说明：解析一条语句。
+station parse_flow(tokens, _pos) {
+    ~idx: skip_seps(tokens: tokens, _pos: _pos)
+    ~tok: tk(tokens: tokens, _pos: idx)
+    when tok.k is "KW" and tok.v is "EMIT" {
+        out value: parse_emit(tokens: tokens, _pos: idx)
+    } otherwise when tok.k is "KW" and tok.v is "WHEN" {
+        out value: parse_when(tokens: tokens, _pos: idx)
+    } otherwise when tok.k is "KW" and tok.v is "CYCLE" {
+        out value: parse_cycle(tokens: tokens, _pos: idx)
+    } otherwise when tok.k is "KW" and tok.v is "FOR" {
+        out value: parse_for(tokens: tokens, _pos: idx)
+    } otherwise when tok.k is "KW" and tok.v is "OUT" {
+        out value: parse_out(tokens: tokens, _pos: idx)
+    } otherwise when tok.k is "KW" and tok.v is "RETURN" {
+        out value: parse_return(tokens: tokens, _pos: idx)
+    } otherwise when tok.k is "KW" and tok.v is "HALT" {
+        out value: assembly{ node: assembly{ n: "halt" }, pos: idx + 1 }
+    } otherwise when tok.k is "KW" and tok.v is "SKIP" {
+        out value: assembly{ node: assembly{ n: "skip" }, pos: idx + 1 }
+    } otherwise when tok.k is "KW" and tok.v is "WIRE" {
+        -- 块内也可以声明局部 wire（station 体内的状态）。
+        out value: parse_wire(tokens: tokens, _pos: idx)
+    } otherwise when tok.k is "SEP" {
+        out value: assembly{ node: nothing, pos: idx + 1 }
+    } otherwise when tok.k is "IDENT" and tk(tokens: tokens, _pos: idx + 1).k is "KW" and tk(tokens: tokens, _pos: idx + 1).v is "EMIT" {
+        -- 中缀 emit：`x <- 值`。只在语句开头匹配，否则 `show(a) emit x: 1`
+        -- 会被误解成对 show(...) 的结果再赋值（target 为空）。
+        ~rhs: parse_expr(tokens: tokens, _pos: idx + 2, min_prec: 0)
+        out value: assembly{
+            node: assembly{ n: "emit", target: tok.v, value: rhs.node },
+            pos: rhs.pos
+        }
+    } otherwise {
+        out value: parse_expr_flow(tokens: tokens, _pos: idx)
+    }
+}
+
+-- 说明：表达式语句。若「标识符 + { … }」这种形态出现，说明关键字拼错了
+-- （`wenn on { … }`），记成 badkw 节点，由静态检查报 E0101。
+station parse_expr_flow(tokens, _pos) {
+    ~first: tk(tokens: tokens, _pos: _pos)
+    ~parsed: parse_expr(tokens: tokens, _pos: _pos, min_prec: 0)
+    ~after: skip_seps(tokens: tokens, _pos: parsed.pos)
+    when first.k is "IDENT" and at_punct(tokens: tokens, _pos: after, punct: "{") {
+        out value: assembly{
+            node: assembly{ n: "badkw", name: first.t },
+            pos: after
+        }
+    } otherwise {
+        out value: assembly{ node: assembly{ n: "flow", expr: parsed.node }, pos: parsed.pos }
+    }
+}
+
+-- 说明：emit 名称 [: 值]。
+station parse_emit(tokens, _pos) {
+    ~name_tok: tk(tokens: tokens, _pos: _pos + 1)
+    ~idx: _pos + 2
+    ~value: assembly{ n: "nil" }
+    when at_punct(tokens: tokens, _pos: idx, punct: ":") or at_punct(tokens: tokens, _pos: idx, punct: "=") {
+        ~parsed: parse_expr(tokens: tokens, _pos: idx + 1, min_prec: 0)
+        emit value: parsed.node
+        emit idx: parsed.pos
+    }
+    out value: assembly{
+        node: assembly{ n: "emit", target: name_tok.v, value: value },
+        pos: idx
+    }
+}
+
+-- 说明：when 条件 [then] 块 [otherwise (when … | 块)]。
+station parse_when(tokens, _pos) {
+    ~cond: parse_expr(tokens: tokens, _pos: _pos + 1, min_prec: 0)
+    ~idx: cond.pos
+    when at_kw(tokens: tokens, _pos: idx, names: ["THEN"]) {
+        emit idx: idx + 1
+    }
+    ~body: parse_block(tokens: tokens, _pos: idx)
+    ~after: skip_seps(tokens: tokens, _pos: body.pos)
+    when at_kw(tokens: tokens, _pos: after, names: ["OTHERWISE"]) {
+        ~scan: parse_otherwise(tokens: tokens, _pos: after + 1)
+        out value: assembly{
+            node: assembly{ n: "when", cond: cond.node, body: body.node, other: scan.node },
+            pos: scan.pos
+        }
+    } otherwise {
+        out value: assembly{
+            node: assembly{ n: "when", cond: cond.node, body: body.node, other: nothing },
+            pos: after
+        }
+    }
+}
+
+-- 说明：otherwise 之后：又是一个 when，还是一个块。
+station parse_otherwise(tokens, _pos) {
+    ~idx: skip_seps(tokens: tokens, _pos: _pos)
+    when at_kw(tokens: tokens, _pos: idx, names: ["WHEN"]) {
+        out value: parse_when(tokens: tokens, _pos: idx)
+    } otherwise {
+        ~body: parse_block(tokens: tokens, _pos: idx)
+        out value: assembly{
+            node: assembly{ n: "block", body: body.node },
+            pos: body.pos
+        }
+    }
+}
+
+-- 说明：cycle（计数 / while / until / over）[as 名称] 块。
+station parse_cycle(tokens, _pos) {
+    ~idx: _pos + 1
+    when at_kw(tokens: tokens, _pos: idx, names: ["WHILE"]) {
+        ~head: parse_expr(tokens: tokens, _pos: idx + 1, min_prec: 0)
+        out value: parse_cycle_tail(tokens: tokens, _pos: head.pos, ckind: "while", head: head.node)
+    } otherwise when at_kw(tokens: tokens, _pos: idx, names: ["UNTIL"]) {
+        ~head: parse_expr(tokens: tokens, _pos: idx + 1, min_prec: 0)
+        out value: parse_cycle_tail(tokens: tokens, _pos: head.pos, ckind: "until", head: head.node)
+    } otherwise when at_kw(tokens: tokens, _pos: idx, names: ["OVER"]) {
+        ~head: parse_expr(tokens: tokens, _pos: idx + 1, min_prec: 0)
+        out value: parse_cycle_tail(tokens: tokens, _pos: head.pos, ckind: "over", head: head.node)
+    } otherwise {
+        ~head: parse_expr(tokens: tokens, _pos: idx, min_prec: 0)
+        out value: parse_cycle_tail(tokens: tokens, _pos: head.pos, ckind: "count", head: head.node)
+    }
+}
+
+-- 说明：cycle 头部之后的 [as 名称] 与块。
+station parse_cycle_tail(tokens, _pos, ckind, head) {
+    ~idx: _pos
+    ~var: nothing
+    when at_kw(tokens: tokens, _pos: idx, names: ["AS"]) {
+        ~name_tok: tk(tokens: tokens, _pos: idx + 1)
+        emit var: name_tok.v
+        emit idx: idx + 2
+    }
+    ~body: parse_block(tokens: tokens, _pos: idx)
+    out value: assembly{
+        node: assembly{ n: "cycle", ckind: ckind, head: head, var: var, body: body.node },
+        pos: body.pos
+    }
+}
+
+-- 说明：for 名称 in 表达式 块。
+station parse_for(tokens, _pos) {
+    ~name_tok: tk(tokens: tokens, _pos: _pos + 1)
+    ~idx: _pos + 2
+    when at_kw(tokens: tokens, _pos: idx, names: ["IN"]) {
+        emit idx: idx + 1
+    }
+    ~items: parse_expr(tokens: tokens, _pos: idx, min_prec: 0)
+    ~body: parse_block(tokens: tokens, _pos: items.pos)
+    out value: assembly{
+        node: assembly{ n: "for", var: name_tok.v, items: items.node, body: body.node },
+        pos: body.pos
+    }
+}
+
+-- 说明：out 端口 [: 值]。
+station parse_out(tokens, _pos) {
+    ~name_tok: tk(tokens: tokens, _pos: _pos + 1)
+    ~idx: _pos + 2
+    ~value: assembly{ n: "nil" }
+    when at_punct(tokens: tokens, _pos: idx, punct: ":") or at_punct(tokens: tokens, _pos: idx, punct: "=") {
+        ~parsed: parse_expr(tokens: tokens, _pos: idx + 1, min_prec: 0)
+        emit value: parsed.node
+        emit idx: parsed.pos
+    }
+    out value: assembly{
+        node: assembly{ n: "out", name: name_tok.v, value: value },
+        pos: idx
+    }
+}
+
+-- 说明：return [值]。
+station parse_return(tokens, _pos) {
+    ~idx: _pos + 1
+    ~value: assembly{ n: "nil" }
+    when not at_sep(tokens: tokens, _pos: idx) {
+        ~parsed: parse_expr(tokens: tokens, _pos: idx, min_prec: 0)
+        emit value: parsed.node
+        emit idx: parsed.pos
+    }
+    out value: assembly{ node: assembly{ n: "return", value: value }, pos: idx }
+}
+
+-- 说明：表达式（优先级爬升）。
+station parse_expr(tokens, _pos, min_prec) {
+    ~first: parse_unary(tokens: tokens, _pos: _pos)
+    ~nd: first.node
+    ~idx: first.pos
+    cycle while tk(tokens: tokens, _pos: idx).k is "OP" {
+        ~info: op_info(name: tk(tokens: tokens, _pos: idx).v)
+        when info is nothing { halt }
+        when info.arity isnot "infix" { halt }
+        when info.prec below min_prec { halt }
+        ~next_min: info.prec + 1
+        when info.assoc is "right" { emit next_min: info.prec }
+        ~rhs: parse_expr(tokens: tokens, _pos: idx + 1, min_prec: next_min)
+        emit nd: assembly{ n: "bin", op: info.name, lhs: nd, rhs: rhs.node }
+        emit idx: rhs.pos
+    }
+    out value: assembly{ node: nd, pos: idx }
+}
+
+-- 说明：一元前缀（not / 负号）。
+station parse_unary(tokens, _pos) {
+    ~tok: tk(tokens: tokens, _pos: _pos)
+    when tok.k is "OP" and (tok.v is "NOT" or tok.v is "MINUS") {
+        ~operand: parse_unary(tokens: tokens, _pos: _pos + 1)
+        out value: assembly{
+            node: assembly{ n: "un", op: tok.v, operand: operand.node },
+            pos: operand.pos
+        }
+    } otherwise {
+        out value: parse_postfix(tokens: tokens, _pos: _pos)
+    }
+}
+
+-- 说明：后缀：取字段 / 括号调用 / 隐式调用。
+station parse_postfix(tokens, _pos) {
+    ~first: parse_primary(tokens: tokens, _pos: _pos)
+    ~cur: first.node
+    ~idx: first.pos
+    cycle while on {
+        ~tok: tk(tokens: tokens, _pos: idx)
+        when tok.k is "PUNCT" and tok.v is "." {
+            ~member: tk(tokens: tokens, _pos: idx + 1)
+            ~after: tk(tokens: tokens, _pos: idx + 2)
+            ~is_call: after.k is "PUNCT" and after.v is "("
+            when cur.n is "name" and (not cur.glyph) and is_call {
+                emit cur: assembly{ n: "name", name: cur.name + "." + member_name(tok: member), glyph: off }
+            } otherwise {
+                emit cur: assembly{ n: "field", base: cur, name: member_name(tok: member) }
+            }
+            emit idx: idx + 2
+        } otherwise when tok.k is "PUNCT" and tok.v is "(" {
+            ~args: parse_paren_args(tokens: tokens, _pos: idx + 1)
+            emit cur: make_call(nd: cur, args: args.list)
+            emit idx: args.pos
+        } otherwise when callable_here(nd: cur) and starts_implicit_arg(tokens: tokens, _pos: idx) {
+            ~args: parse_implicit_args(tokens: tokens, _pos: idx)
+            emit cur: make_call(nd: cur, args: args.list)
+            emit idx: args.pos
+        } otherwise {
+            halt
+        }
+    }
+    out value: assembly{ node: cur, pos: idx }
+}
+
+-- 说明：点号后面的成员名。
+-- 关键字/字面量成员（`fs.read` 的 read 是 DRAW 的拼写）必须取**原文**，
+-- 取规范名会得到 `fs.DRAW`，Python 版同样用原始文本。
+station member_name(tok) {
+    ~acc: tok.v
+    when tok.k isnot "IDENT" {
+        when tok.t isnot nothing { emit acc: tok.t }
+    }
+    out value: acc
+}
+
+-- 说明：当前节点能否直接作为被调用者。
+station callable_here(nd) {
+    ~hit: off
+    when nd.n is "name" { emit hit: on }
+    when nd.n is "field" { emit hit: on }
+    out value: hit
+}
+
+-- 说明：该 token 能否开启一个隐式实参。
+station starts_implicit_arg(tokens, _pos) {
+    ~tok: tk(tokens: tokens, _pos: _pos)
+    ~hit: off
+    when tok.k is "IDENT" { emit hit: on }
+    when tok.k is "NUMBER" { emit hit: on }
+    when tok.k is "TEXT" { emit hit: on }
+    when tok.k is "FLAG" { emit hit: on }
+    when tok.k is "NIL" { emit hit: on }
+    when tok.k is "GLYPH" { emit hit: on }
+    when tok.k is "PUNCT" and (tok.v is "(" or tok.v is "[" or tok.v is "⟨") { emit hit: on }
+    when tok.k is "KW" and (tok.v is "ASSEMBLY" or tok.v is "DRAW") { emit hit: on }
+    out value: hit
+}
+
+-- 说明：造一个调用节点。名字（含符号拼写，如 »）一律内联到 name 字段，
+-- 这样调用点只需按名字查内置/station；其余表达式放进 callee。
+station make_call(nd, args) {
+    when nd.n is "name" {
+        out value: assembly{ n: "call", name: nd.name, args: args, callee: nothing }
+    } otherwise {
+        out value: assembly{ n: "call", name: "", args: args, callee: nd }
+    }
+}
+
+-- 说明：括号实参列表。
+station parse_paren_args(tokens, _pos) {
+    ~args: []
+    ~idx: _pos
+    cycle while not at_punct(tokens: tokens, _pos: idx, punct: ")") {
+        ~tok: tk(tokens: tokens, _pos: idx)
+        when tok.k is "EOF" { halt }
+        when tok.k is "SEP" {
+            emit idx: idx + 1
+        } otherwise when tok.k is "PUNCT" and tok.v is "," {
+            emit idx: idx + 1
+        } otherwise {
+            ~arg: parse_arg(tokens: tokens, _pos: idx)
+            emit args: push(into: args, value: arg.node)
+            when arg.pos atmost idx { halt }
+            emit idx: arg.pos
+        }
+    }
+    out value: assembly{ list: args, pos: idx + 1 }
+}
+
+-- 说明：隐式实参列表（无括号，逗号分隔）。
+station parse_implicit_args(tokens, _pos) {
+    ~args: []
+    ~idx: _pos
+    ~more: on
+    cycle while more {
+        ~arg: parse_arg(tokens: tokens, _pos: idx)
+        emit args: push(into: args, value: arg.node)
+        emit idx: arg.pos
+        when at_punct(tokens: tokens, _pos: idx, punct: ",") {
+            emit idx: idx + 1
+        } otherwise {
+            emit more: off
+        }
+    }
+    out value: assembly{ list: args, pos: idx }
+}
+
+-- 说明：单个实参：可选 `标签:` 前缀 + 表达式。
+station parse_arg(tokens, _pos) {
+    ~tok: tk(tokens: tokens, _pos: _pos)
+    ~after: tk(tokens: tokens, _pos: _pos + 1)
+    when tok.k is "IDENT" and after.k is "PUNCT" and after.v is ":" {
+        ~value: parse_expr(tokens: tokens, _pos: _pos + 2, min_prec: 0)
+        out value: assembly{
+            node: assembly{ label: tok.v, value: value.node },
+            pos: value.pos
+        }
+    } otherwise {
+        ~value: parse_expr(tokens: tokens, _pos: _pos, min_prec: 0)
+        out value: assembly{
+            node: assembly{ label: nothing, value: value.node },
+            pos: value.pos
+        }
+    }
+}
+
+-- 说明：基本表达式。
+station parse_primary(tokens, _pos) {
+    ~tok: tk(tokens: tokens, _pos: _pos)
+    when tok.k is "NUMBER" {
+        out value: assembly{ node: assembly{ n: "num", value: tok.v }, pos: _pos + 1 }
+    } otherwise when tok.k is "TEXT" {
+        out value: assembly{ node: assembly{ n: "text", value: tok.v }, pos: _pos + 1 }
+    } otherwise when tok.k is "FLAG" {
+        out value: assembly{ node: assembly{ n: "flag", value: tok.v }, pos: _pos + 1 }
+    } otherwise when tok.k is "NIL" {
+        out value: assembly{ node: assembly{ n: "nil" }, pos: _pos + 1 }
+    } otherwise when tok.k is "GLYPH" {
+        out value: assembly{ node: assembly{ n: "name", name: tok.v, glyph: on }, pos: _pos + 1 }
+    } otherwise when tok.k is "IDENT" {
+        out value: assembly{ node: assembly{ n: "name", name: tok.v, glyph: off }, pos: _pos + 1 }
+    } otherwise when tok.k is "KW" and tok.v is "DRAW" {
+        ~name_tok: tk(tokens: tokens, _pos: _pos + 1)
+        out value: assembly{ node: assembly{ n: "read", name: name_tok.v }, pos: _pos + 2 }
+    } otherwise when tok.k is "KW" and tok.v is "ASSEMBLY" {
+        out value: parse_assembly(tokens: tokens, _pos: _pos + 1)
+    } otherwise when tok.k is "PUNCT" and tok.v is "[" {
+        out value: parse_list(tokens: tokens, _pos: _pos + 1, closer: "]")
+    } otherwise when tok.k is "PUNCT" and tok.v is "⟨" {
+        out value: parse_list(tokens: tokens, _pos: _pos + 1, closer: "⟩")
+    } otherwise when tok.k is "PUNCT" and tok.v is "(" {
+        ~inner: parse_expr(tokens: tokens, _pos: _pos + 1, min_prec: 0)
+        ~after: inner.pos
+        when at_punct(tokens: tokens, _pos: after, punct: ")") { emit after: after + 1 }
+        out value: assembly{ node: inner.node, pos: after }
+    } otherwise {
+        out value: assembly{ node: assembly{ n: "nil" }, pos: _pos + 1 }
+    }
+}
+
+-- 说明：列表字面量。
+station parse_list(tokens, _pos, closer) {
+    ~items: []
+    ~idx: _pos
+    cycle while not at_punct(tokens: tokens, _pos: idx, punct: closer) {
+        ~tok: tk(tokens: tokens, _pos: idx)
+        when tok.k is "EOF" { halt }
+        when tok.k is "SEP" {
+            emit idx: idx + 1
+        } otherwise when tok.k is "PUNCT" and tok.v is "," {
+            emit idx: idx + 1
+        } otherwise {
+            ~item: parse_expr(tokens: tokens, _pos: idx, min_prec: 0)
+            emit items: push(into: items, value: item.node)
+            when item.pos atmost idx { halt }
+            emit idx: item.pos
+        }
+    }
+    out value: assembly{ node: assembly{ n: "list", items: items }, pos: idx + 1 }
+}
+
+-- 说明：装配体字面量 assembly{ 键: 值 … }。
+station parse_assembly(tokens, _pos) {
+    ~idx: _pos
+    when at_punct(tokens: tokens, _pos: idx, punct: "{") { emit idx: idx + 1 }
+    ~fields: []
+    cycle while not at_punct(tokens: tokens, _pos: idx, punct: "}") {
+        ~tok: tk(tokens: tokens, _pos: idx)
+        when tok.k is "EOF" { halt }
+        when tok.k is "SEP" {
+            emit idx: idx + 1
+        } otherwise when tok.k is "PUNCT" and tok.v is "," {
+            emit idx: idx + 1
+        } otherwise {
+            -- 字段名：标识符直接用，关键字/字面量（none / text / kind …）
+            -- 借原文 tok.t 兜住，与 Python 版 _key_name 的宽容度一致。
+            ~key: tok.v
+            when tok.k isnot "IDENT" { emit key: tok.t }
+            ~after: idx + 1
+            when at_punct(tokens: tokens, _pos: after, punct: ":") or at_punct(tokens: tokens, _pos: after, punct: "=") {
+                emit after: after + 1
+            }
+            ~value: parse_expr(tokens: tokens, _pos: after, min_prec: 0)
+            emit fields: push(into: fields, value: assembly{ name: key, value: value.node })
+            when value.pos atmost idx { halt }
+            emit idx: value.pos
+        }
+    }
+    out value: assembly{ node: assembly{ n: "asm", fields: fields }, pos: idx + 1 }
+}
+
+-- 说明：对外入口：源码 → { items, errors }。
+station parse(source) {
+    ~scanned: lex(source)
+    ~program: parse_program(tokens: scanned.tokens)
+    out value: assembly{ items: program.items, errors: scanned.errors }
+}

@@ -1,0 +1,4 @@
+station greet(name) {
+    out value: "hello, " + name
+}
+show(greet("mi"))
